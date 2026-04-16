@@ -121,7 +121,11 @@ def main() -> None:
     pt.add_argument(
         "text",
         nargs="?",
-        default="Hello, this is a test of text to speech latency.",
+        default=(
+            "Hello, this is a test of text to speech latency. "
+            "We're just testing how well this speach library works. "
+            "Pretty great, huh?!"
+        ),
     )
 
     args = parser.parse_args()
