@@ -7,6 +7,13 @@ requires-python = ">=3.13"
 authors = [
     { name = "Jason Weddington", email = "jason-weddington@users.noreply.github.com" },
 ]
+dependencies = [
+    "kokoro>=0.9.4",
+    "mlx-whisper>=0.4.3",
+    "numpy>=2.4.4",
+    "sounddevice>=0.5.5",
+    "soundfile>=0.13.1",
+]
 
 
 [build-system]
