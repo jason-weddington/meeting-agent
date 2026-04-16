@@ -1,0 +1,82 @@
+[project]
+name = "meeting-agent"
+version = "0.1.0"
+description = "Real-time AI agent that participates in meetings"
+requires-python = ">=3.13"
+
+authors = [
+    { name = "Jason Weddington", email = "jason-weddington@users.noreply.github.com" },
+]
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/meeting_agent"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.0",
+    "pytest>=8.0",
+    "pytest-cov>=6.0",
+    "mypy>=1.14",
+    "python-semantic-release>=9.0",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "S",     # bandit (security)
+    "B",     # bugbear
+    "D",     # pydocstyle
+    "UP",    # pyupgrade
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S106", "D"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[tool.coverage.run]
+source = ["meeting_agent"]
+
+[tool.coverage.report]
+fail_under = 80
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+changelog_file = "CHANGELOG.md"
+build_command = """
+    uv lock --upgrade-package "$PACKAGE_NAME"
+    git add uv.lock
+    uv build
+"""
+allow_zero_version = true
+major_on_zero = false
+commit_message = "chore(release): v{version}"
+
+[tool.semantic_release.publish]
+upload_to_vcs_release = true
+
+[tool.semantic_release.remote]
+type = "github"
+ignore_token_for_push = true
