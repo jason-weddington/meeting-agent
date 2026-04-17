@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.9.0 (2026-04-17)
+
+### Features
+
+- **pipeline**: Implement Pipeline.run with first-sentence TTS pipelining
+  ([`7211683`](https://github.com/repos/meeting-agent/commit/7211683f60b4ab4fcf6ba4d0187d359e08bc41e3))
+
+
 ## v0.8.0 (2026-04-17)
 
 ### Features
