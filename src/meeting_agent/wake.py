@@ -12,7 +12,10 @@ to still produce correct predictions in practice.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
+from openwakeword import models as _bundled
 from openwakeword.model import Model
 
 from meeting_agent.audio import AudioArray
@@ -32,11 +35,21 @@ class WakeDetector:
         """Load the openwakeword model for the given wake phrase.
 
         Args:
-            wake_phrase: One of openwakeword's bundled models
-                (e.g. ``hey_jarvis``, ``alexa``) or a path to a custom model.
+            wake_phrase: One of openwakeword's bundled model names
+                (``alexa``, ``hey_jarvis``, ``hey_mycroft``, ``timer``,
+                ``weather``) or a filesystem path to a custom ``.onnx`` model.
         """
         self.wake_phrase = wake_phrase
-        self._model = Model(wakeword_models=[wake_phrase])
+        if wake_phrase in _bundled:
+            model_path = _bundled[wake_phrase]["model_path"]
+        elif Path(wake_phrase).is_file():
+            model_path = wake_phrase
+        else:
+            raise ValueError(
+                f"wake_phrase {wake_phrase!r} is not a bundled model "
+                f"({sorted(_bundled.keys())}) or an existing file path"
+            )
+        self._model = Model(wakeword_model_paths=[model_path])
 
     def detect(self, audio_chunk: AudioArray) -> bool:
         """Return True if the wake phrase was detected in this chunk.

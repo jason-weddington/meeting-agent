@@ -8,10 +8,33 @@ from meeting_agent.wake import DETECTION_THRESHOLD, WakeDetector
 
 
 @patch("meeting_agent.wake.Model")
-def test_init_passes_wake_phrase_to_model(mock_model_cls):
-    """WakeDetector.__init__ passes wakeword_models=[wake_phrase] to Model."""
+def test_init_resolves_bundled_phrase_to_model_path(mock_model_cls):
+    """Bundled wake-phrase names are resolved to ONNX paths before Model init."""
     WakeDetector("hey_jarvis")
-    mock_model_cls.assert_called_once_with(wakeword_models=["hey_jarvis"])
+    call = mock_model_cls.call_args
+    paths = call.kwargs["wakeword_model_paths"]
+    assert len(paths) == 1
+    assert paths[0].endswith(".onnx")
+    assert "hey_jarvis" in paths[0]
+
+
+@patch("meeting_agent.wake.Model")
+def test_init_rejects_unknown_phrase(mock_model_cls):
+    """Non-bundled phrase that isn't a file path raises ValueError."""
+    import pytest
+
+    with pytest.raises(ValueError, match="not a bundled model"):
+        WakeDetector("unknown_phrase")
+    mock_model_cls.assert_not_called()
+
+
+@patch("meeting_agent.wake.Model")
+def test_init_accepts_custom_model_file(mock_model_cls, tmp_path):
+    """A filesystem path to an existing file is passed through as-is."""
+    custom = tmp_path / "custom.onnx"
+    custom.write_bytes(b"")  # content doesn't matter; Model is mocked
+    WakeDetector(str(custom))
+    mock_model_cls.assert_called_once_with(wakeword_model_paths=[str(custom)])
 
 
 @patch("meeting_agent.wake.Model")
