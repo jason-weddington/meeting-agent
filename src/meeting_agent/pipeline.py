@@ -7,9 +7,23 @@ gates the mic while the agent is speaking to avoid feedback.
 
 from __future__ import annotations
 
+import logging
+import queue
+import re
+import threading
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
-from meeting_agent.llm import ProjectContext
+from meeting_agent import audio
+from meeting_agent.asr import StreamingASR, Utterance
+from meeting_agent.audio import AudioArray
+from meeting_agent.llm import BedrockClient, Conversation, ProjectContext, Turn
+from meeting_agent.tts import SAMPLE_RATE as TTS_SAMPLE_RATE
+from meeting_agent.tts import TTS
+from meeting_agent.wake import WakeDetector
+
+_metrics = logging.getLogger("meeting_agent.metrics")
 
 
 @dataclass
@@ -43,4 +57,213 @@ class Pipeline:
 
     def run(self) -> None:
         """Run the pipeline until interrupted (Ctrl-C)."""
-        raise NotImplementedError
+        config = self.config
+
+        # Build components — model loads happen here.
+        chunks_iter = audio.record_chunks(device=config.input_device, chunk_ms=100)
+        wake = WakeDetector(config.wake_phrase)
+        asr = StreamingASR(initial_prompt=config.asr_initial_prompt)
+        tts = TTS()
+        llm = BedrockClient(model_id=config.model_id)
+
+        # Rolling transcript initialised empty.
+        conversation = Conversation(older_turns=[], latest_turn=None)
+
+        try:
+            while True:
+                # Stage 1: wait for wake-word (mic is active; chunks consumed here).
+                t_wake = self._wait_for_wake(chunks_iter, wake)
+
+                # Stage 2: transcribe the user's utterance.
+                utterance = self._collect_utterance(chunks_iter, asr)
+                t_asr_done = time.monotonic()
+                _metrics.info("asr_latency_s=%.3f", t_asr_done - t_wake)
+
+                # Update conversation with the new user turn.
+                conversation.latest_turn = Turn(speaker="user", text=utterance.text)
+
+                # Stage 3: stream LLM response, pipeline TTS, play audio.
+                # Mic is implicitly gated here: chunks_iter is not read while
+                # _stream_and_play is executing, so wake detection is suspended.
+                full_response = self._stream_and_play(config, conversation, llm, tts, t_asr_done)
+
+                # Commit the completed exchange to the rolling transcript.
+                conversation.older_turns.append(Turn(speaker="user", text=utterance.text))
+                conversation.older_turns.append(Turn(speaker="agent", text=full_response))
+                conversation.latest_turn = None
+
+        except KeyboardInterrupt:
+            pass
+
+    # ------------------------------------------------------------------
+    # Named pipeline stages — kept separate for testability.
+    # ------------------------------------------------------------------
+
+    def _wait_for_wake(
+        self,
+        chunks_iter: Iterator[AudioArray],
+        wake: WakeDetector,
+    ) -> float:
+        """Block until a wake-word trigger is detected.
+
+        Args:
+            chunks_iter: Continuous 16 kHz audio chunk iterator.
+            wake: Configured wake-word detector.
+
+        Returns:
+            Monotonic timestamp of the wake detection event.
+        """
+        for chunk in chunks_iter:
+            if wake.detect(chunk):
+                return time.monotonic()
+        return time.monotonic()  # iterator exhausted (edge case / tests)
+
+    def _collect_utterance(
+        self,
+        chunks_iter: Iterator[AudioArray],
+        asr: StreamingASR,
+    ) -> Utterance:
+        """Feed audio chunks to ASR and return the first completed utterance.
+
+        Args:
+            chunks_iter: Same continuous chunk iterator used by
+                :meth:`_wait_for_wake`; ASR consumes subsequent chunks.
+            asr: Streaming ASR instance with Silero VAD endpointing.
+
+        Returns:
+            The first :class:`~meeting_agent.asr.Utterance` produced.
+
+        Raises:
+            RuntimeError: If the ASR stream ends without yielding an utterance.
+        """
+        for utterance in asr.transcribe_stream(chunks_iter):
+            return utterance
+        raise RuntimeError("ASR stream ended without producing an utterance")
+
+    def _stream_and_play(
+        self,
+        config: PipelineConfig,
+        conversation: Conversation,
+        llm: BedrockClient,
+        tts: TTS,
+        t_asr_done: float,
+    ) -> str:
+        """Stream Claude's response, pipeline TTS on sentence boundaries.
+
+        Sentence boundaries (``.``, ``?``, ``!``) flush the accumulated buffer
+        into a worker thread that handles TTS synthesis and speaker playback in
+        parallel with the LLM continuing to stream subsequent sentences.
+
+        The mic is implicitly gated during this method: :meth:`_wait_for_wake`
+        is not invoked, so wake-word detection is suspended for the duration of
+        agent speech.
+
+        Latency events logged to ``meeting_agent.metrics``:
+
+        * ``bedrock_ttft_s`` — time from end-of-utterance to first LLM delta.
+        * ``tts_pipeline_overhead_s`` — time from first LLM delta to first
+          TTS audio chunk.
+        * ``total_turn_latency_s`` — wake-to-first-speaker-audio latency.
+
+        Args:
+            config: Pipeline config (output device, project context, model id).
+            conversation: Rolling transcript with ``latest_turn`` already set.
+            llm: Bedrock client for streaming the response.
+            tts: TTS instance for synthesis.
+            t_asr_done: Monotonic timestamp when ASR finished (latency anchor).
+
+        Returns:
+            The full agent response as a single concatenated string.
+        """
+        sentence_q: queue.Queue[str | None] = queue.Queue()
+        first_delta_t: list[float] = []
+        first_audio_t: list[float] = []
+
+        def _tts_worker() -> None:
+            """Consume sentences, synthesise, and play until sentinel arrives."""
+            while True:
+                sentence = sentence_q.get()
+                if sentence is None:
+                    return
+                for chunk in tts.stream_synthesize(sentence):
+                    if not first_audio_t:
+                        t = time.monotonic()
+                        first_audio_t.append(t)
+                        if first_delta_t:
+                            _metrics.info(
+                                "tts_pipeline_overhead_s=%.3f",
+                                t - first_delta_t[0],
+                            )
+                        _metrics.info("total_turn_latency_s=%.3f", t - t_asr_done)
+                    audio.play(
+                        chunk,
+                        sample_rate=TTS_SAMPLE_RATE,
+                        device=config.output_device,
+                    )
+
+        worker = threading.Thread(target=_tts_worker, daemon=True)
+        worker.start()
+
+        full_response = ""
+        buffer = ""
+        first_delta_logged = False
+
+        try:
+            for delta in llm.respond_stream(config.context, conversation):
+                if not first_delta_logged:
+                    t = time.monotonic()
+                    first_delta_t.append(t)
+                    _metrics.info("bedrock_ttft_s=%.3f", t - t_asr_done)
+                    first_delta_logged = True
+
+                full_response += delta
+                buffer += delta
+
+                # Flush completed sentences into the TTS worker queue.
+                complete, buffer = _split_at_sentence_boundaries(buffer)
+                for sentence in complete:
+                    if sentence.strip():
+                        sentence_q.put(sentence)
+        finally:
+            # Flush any remaining (unpunctuated) tail as the final sentence.
+            if buffer.strip():
+                sentence_q.put(buffer)
+            sentence_q.put(None)  # sentinel — stops the worker
+            worker.join()
+
+        return full_response
+
+
+def _split_at_sentence_boundaries(text: str) -> tuple[list[str], str]:
+    """Split *text* into complete sentences and an incomplete tail.
+
+    Splits on ``.``, ``?``, and ``!`` using a capturing regex so each complete
+    sentence retains its terminal punctuation. The final segment (which has no
+    terminal punctuation) is returned as the tail.
+
+    V1 edge-case policy: over-segmentation (e.g. "Dr.") is acceptable — it
+    results in an extra small TTS call rather than a correctness failure.
+
+    Args:
+        text: Accumulated text from LLM token deltas.
+
+    Returns:
+        A ``(complete_sentences, incomplete_tail)`` 2-tuple where each element
+        of ``complete_sentences`` ends with ``.``, ``?``, or ``!``.
+
+    Examples:
+        >>> _split_at_sentence_boundaries("Hello. World!")
+        (['Hello.', ' World!'], '')
+        >>> _split_at_sentence_boundaries("Hello")
+        ([], 'Hello')
+    """
+    parts = re.split(r"([.?!])", text)
+    # parts alternates text / delimiter, with a final remainder element:
+    # "Hello. World!" → ["Hello", ".", " World", "!", ""]
+    sentences: list[str] = []
+    i = 0
+    while i + 1 < len(parts):
+        sentences.append(parts[i] + parts[i + 1])
+        i += 2
+    remainder = parts[i] if i < len(parts) else ""
+    return sentences, remainder

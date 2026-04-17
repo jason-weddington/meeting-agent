@@ -103,6 +103,10 @@ source = ["meeting_agent"]
 # do not lower past the measured floor.
 fail_under = 98
 
+# NOTE: Actual total coverage is 98.83%. Leaving fail_under at 98 gives
+# a 1-point ratchet margin for legitimate refactors; ratchet to 99 once
+# we trim dead-code paths in pipeline.py (lines 125, 147).
+
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
 changelog_file = "CHANGELOG.md"
