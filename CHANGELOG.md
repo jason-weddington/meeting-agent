@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.9.3 (2026-04-17)
+
+### Bug Fixes
+
+- **deps**: Add awscrt for new aws login CRT-based cred provider
+  ([`072dc0d`](https://github.com/repos/meeting-agent/commit/072dc0d1a7c219a16ff5121fcbea6dfadcedf051))
+
+### Chores
+
+- **pipeline**: Print status when listening for wake and after trigger
+  ([`b8ff607`](https://github.com/repos/meeting-agent/commit/b8ff6070a28fefa473404b3a787bcc61b7e3cab9))
+
+
 ## v0.9.2 (2026-04-17)
 
 ### Bug Fixes
