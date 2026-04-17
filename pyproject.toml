@@ -12,6 +12,7 @@ dependencies = [
     "kokoro>=0.9.4",
     "mlx-whisper>=0.4.3",
     "numpy>=2.4.4",
+    "openwakeword>=0.4.0",
     "sounddevice>=0.5.5",
     "soundfile>=0.13.1",
 ]
@@ -73,6 +74,10 @@ ignore_missing_imports = true
 module = "sounddevice"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = "openwakeword.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 markers = [
     "integration: end-to-end tests that require real model downloads; run with -m integration",
@@ -84,7 +89,7 @@ source = ["meeting_agent"]
 [tool.coverage.report]
 # Coverage threshold ratchets up as modules gain tests. Keep honest —
 # do not lower past the measured floor.
-fail_under = 71
+fail_under = 77
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
