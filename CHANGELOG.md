@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.8.0 (2026-04-17)
+
+### Features
+
+- **cli**: Implement meeting-agent CLI entry point
+  ([`7415064`](https://github.com/repos/meeting-agent/commit/7415064bfbb503294cc618be1177d28e16411702))
+
+
 ## v0.7.0 (2026-04-17)
 
 ### Features
