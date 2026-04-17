@@ -102,11 +102,11 @@ source = ["meeting_agent"]
 [tool.coverage.report]
 # Coverage threshold ratchets up as modules gain tests. Keep honest —
 # do not lower past the measured floor.
-fail_under = 98
+fail_under = 99
 
-# NOTE: Actual total coverage is 98.83%. Leaving fail_under at 98 gives
-# a 1-point ratchet margin for legitimate refactors; ratchet to 99 once
-# we trim dead-code paths in pipeline.py (lines 125, 147).
+# NOTE: Actual total coverage is 99.20% after V1.5 additions. One
+# uncovered line remains: pipeline.py:137 (iterator-exhausted edge case
+# in _wait_for_wake) and audio.py:90 (hardware-path branch).
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]

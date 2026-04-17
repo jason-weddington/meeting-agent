@@ -19,6 +19,7 @@ import pytest
 
 from meeting_agent.asr import (
     _EOS_CHUNK_COUNT,
+    _SILENCE_PEAK_THRESHOLD,
     _VAD_WINDOW,
     DEFAULT_MODEL_REPO,
     StreamingASR,
@@ -350,6 +351,145 @@ def test_two_speech_segments_two_utterances(
     assert results[1].text == "second"
     # Second segment must start no earlier than the first one ends.
     assert results[1].start_s >= results[0].end_s
+
+
+# ---------------------------------------------------------------------------
+# V1.5: Silence peak gate
+# ---------------------------------------------------------------------------
+
+
+@patch("silero_vad.load_silero_vad")
+@patch("mlx_whisper.transcribe")
+def test_silence_peak_gate_skips_transcription(
+    mock_transcribe: MagicMock,
+    mock_load_vad: MagicMock,
+) -> None:
+    """VAD triggers but audio peak is below _SILENCE_PEAK_THRESHOLD → transcribe NOT called."""
+    # VAD reports speech for 10 chunks, then silence for 5 (enough to close EOS).
+    probs = _vad_probs(0, 10, 5)
+    mock_vad = MagicMock(side_effect=probs)
+    mock_load_vad.return_value = mock_vad
+
+    # Amplitude well below _SILENCE_PEAK_THRESHOLD (0.01) — near-silent buffer.
+    near_silent_amplitude = _SILENCE_PEAK_THRESHOLD * 0.5
+
+    def _near_silent_chunk() -> np.ndarray:
+        return np.ones(CHUNK_SAMPLES, dtype=np.float32) * near_silent_amplitude
+
+    def _chunks() -> Iterator[np.ndarray]:
+        for _ in range(10):
+            yield _near_silent_chunk()
+        for _ in range(5):
+            yield _silent_chunk()
+
+    asr = StreamingASR()
+    results = list(asr.transcribe_stream(_chunks()))
+
+    assert results == []
+    mock_transcribe.assert_not_called()
+
+
+@patch("silero_vad.load_silero_vad")
+@patch("mlx_whisper.transcribe")
+def test_peak_gate_allows_real_speech(
+    mock_transcribe: MagicMock,
+    mock_load_vad: MagicMock,
+) -> None:
+    """When peak is above _SILENCE_PEAK_THRESHOLD, transcribe is called and utterance yielded."""
+    probs = _vad_probs(0, 10, 5)
+    mock_vad = MagicMock(side_effect=probs)
+    mock_load_vad.return_value = mock_vad
+    mock_transcribe.return_value = {"text": "real speech here"}
+
+    # _speech_chunk() amplitude is 0.1, well above _SILENCE_PEAK_THRESHOLD (0.01).
+    asr = StreamingASR()
+    results = list(asr.transcribe_stream(_make_chunk_iter(0, 10, 5)))
+
+    assert len(results) == 1
+    assert results[0].text == "real speech here"
+    mock_transcribe.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# V1.5: Hallucination blocklist
+# ---------------------------------------------------------------------------
+
+
+@patch("silero_vad.load_silero_vad")
+@patch("mlx_whisper.transcribe")
+def test_hallucination_blocklist_drops_transcript(
+    mock_transcribe: MagicMock,
+    mock_load_vad: MagicMock,
+) -> None:
+    """Whisper hallucinations listed in _WHISPER_HALLUCINATIONS are not yielded."""
+    # Test a representative sample: empty string, "thank you", and a variant
+    # that requires normalization ("Thanks for watching." → "thanks for watching").
+    hallucination_cases = (
+        "",
+        "thank you",
+        "Thanks for watching.",
+        "SUBTITLES BY THE AMARA.ORG COMMUNITY",
+    )
+    for text in hallucination_cases:
+        probs = _vad_probs(0, 10, 5)
+        mock_vad = MagicMock(side_effect=probs)
+        mock_load_vad.return_value = mock_vad
+        mock_transcribe.return_value = {"text": text}
+
+        asr = StreamingASR()
+        results = list(asr.transcribe_stream(_make_chunk_iter(0, 10, 5)))
+
+        assert results == [], f"Expected no utterance for hallucination text: {text!r}"
+
+
+@patch("silero_vad.load_silero_vad")
+@patch("mlx_whisper.transcribe")
+def test_hallucination_blocklist_case_insensitive(
+    mock_transcribe: MagicMock,
+    mock_load_vad: MagicMock,
+) -> None:
+    """Hallucination detection is case-insensitive and ignores trailing punctuation."""
+    probs = _vad_probs(0, 10, 5)
+    mock_vad = MagicMock(side_effect=probs)
+    mock_load_vad.return_value = mock_vad
+    # "THANK YOU." → strip → "THANK YOU." → lower → "thank you." → rstrip → "thank you"
+    mock_transcribe.return_value = {"text": "THANK YOU."}
+
+    asr = StreamingASR()
+    results = list(asr.transcribe_stream(_make_chunk_iter(0, 10, 5)))
+
+    assert results == []
+
+
+@patch("silero_vad.load_silero_vad")
+@patch("mlx_whisper.transcribe")
+def test_non_hallucination_transcript_is_yielded(
+    mock_transcribe: MagicMock,
+    mock_load_vad: MagicMock,
+) -> None:
+    """Legitimate transcripts that are not in the blocklist are yielded normally."""
+    probs = _vad_probs(0, 10, 5)
+    mock_vad = MagicMock(side_effect=probs)
+    mock_load_vad.return_value = mock_vad
+    mock_transcribe.return_value = {"text": "what is the project status"}
+
+    asr = StreamingASR()
+    results = list(asr.transcribe_stream(_make_chunk_iter(0, 10, 5)))
+
+    assert len(results) == 1
+    assert results[0].text == "what is the project status"
+
+
+# ---------------------------------------------------------------------------
+# V1.5: VAD threshold constant guard
+# ---------------------------------------------------------------------------
+
+
+def test_vad_threshold_constant_exists() -> None:
+    """_VAD_SPEECH_THRESHOLD must be >= 0.6 (regression guard against accidental downgrades)."""
+    from meeting_agent.asr import _VAD_SPEECH_THRESHOLD
+
+    assert _VAD_SPEECH_THRESHOLD >= 0.6
 
 
 # ---------------------------------------------------------------------------

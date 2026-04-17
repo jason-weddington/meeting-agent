@@ -17,7 +17,8 @@ from meeting_agent.audio import SAMPLE_RATE, AudioArray
 DEFAULT_MODEL_REPO: str = "mlx-community/whisper-large-v3-mlx"
 
 # Speech probability threshold: chunks scoring at or above this are speech.
-_SPEECH_THRESHOLD: float = 0.5
+# Set conservatively at 0.6 to reduce false triggers from ambient noise.
+_VAD_SPEECH_THRESHOLD: float = 0.6
 
 # Consecutive silent chunks required to close an utterance (end-of-speech
 # timeout). At the default 100 ms/chunk from record_chunks, 5 chunks ≈ 500 ms.
@@ -25,6 +26,23 @@ _EOS_CHUNK_COUNT: int = 5
 
 # Silero VAD requires exactly this many samples per call at 16 kHz (32 ms).
 _VAD_WINDOW: int = 512
+
+# Peak amplitude below which a VAD-gated segment is considered effectively
+# silent. Whisper hallucinates "Thank you." on near-silent buffers (≈ -40 dBFS).
+_SILENCE_PEAK_THRESHOLD: float = 0.01
+
+# Known Whisper hallucinations produced on silence/noise buffers, sourced from
+# YouTube training data artifacts. Compared after strip().lower().rstrip(".!?").
+_WHISPER_HALLUCINATIONS: frozenset[str] = frozenset(
+    {
+        "thank you",
+        "thanks for watching",
+        "thanks for watching!",
+        "subtitles by the amara.org community",
+        ".",
+        "",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -110,7 +128,7 @@ class StreamingASR:
                     max_prob = prob
             speech_prob: float = max_prob
 
-            if speech_prob >= _SPEECH_THRESHOLD:
+            if speech_prob >= _VAD_SPEECH_THRESHOLD:
                 if not in_speech:
                     # Silence → speech transition: record segment start time.
                     in_speech = True
@@ -124,19 +142,31 @@ class StreamingASR:
                     buffer.append(chunk)
                     silent_count += 1
                     if silent_count >= _EOS_CHUNK_COUNT:
-                        # End-of-speech timeout reached: transcribe segment.
+                        # End-of-speech timeout reached: attempt to transcribe.
                         segment: AudioArray = np.concatenate(buffer)
-                        result = mlx_whisper.transcribe(
-                            segment,
-                            path_or_hf_repo=self.model_repo,
-                            initial_prompt=self.initial_prompt,
-                        )
-                        end_s: float = elapsed_s + chunk_s
-                        yield Utterance(
-                            text=result["text"],
-                            start_s=start_s,
-                            end_s=end_s,
-                        )
+
+                        # Silence guard: if the concatenated audio peak is
+                        # below threshold, Silero triggered on ambient noise.
+                        # Skip transcription to prevent Whisper from
+                        # hallucinating "Thank you." on near-silent buffers.
+                        peak = float(np.max(np.abs(segment)))
+                        if peak >= _SILENCE_PEAK_THRESHOLD:
+                            result = mlx_whisper.transcribe(
+                                segment,
+                                path_or_hf_repo=self.model_repo,
+                                initial_prompt=self.initial_prompt,
+                            )
+                            # Hallucination blocklist: drop known Whisper
+                            # silence/noise artifacts before yielding.
+                            transcript: str = result["text"]
+                            normalized = transcript.strip().lower().rstrip(".!?")
+                            if normalized not in _WHISPER_HALLUCINATIONS:
+                                end_s: float = elapsed_s + chunk_s
+                                yield Utterance(
+                                    text=transcript,
+                                    start_s=start_s,
+                                    end_s=end_s,
+                                )
                         buffer = []
                         in_speech = False
                         silent_count = 0

@@ -79,6 +79,11 @@ class Pipeline:
 
                 # Stage 2: transcribe the user's utterance.
                 utterance = self._collect_utterance(chunks_iter, asr)
+                if utterance is None:
+                    # False wake / timeout — no real speech detected.
+                    print("No speech detected; listening again.", flush=True)
+                    continue
+
                 t_asr_done = time.monotonic()
                 _metrics.info("asr_latency_s=%.3f", t_asr_done - t_wake)
 
@@ -135,23 +140,37 @@ class Pipeline:
         self,
         chunks_iter: Iterator[AudioArray],
         asr: StreamingASR,
-    ) -> Utterance:
+        timeout_s: float = 15.0,
+    ) -> Utterance | None:
         """Feed audio chunks to ASR and return the first completed utterance.
+
+        Feeds chunks to the ASR for at most ``timeout_s`` seconds. If no
+        utterance completes within that window (e.g. a false wake trigger with
+        no real speech following), returns ``None`` so the caller can loop back
+        to wake-word listening without blocking indefinitely.
 
         Args:
             chunks_iter: Same continuous chunk iterator used by
                 :meth:`_wait_for_wake`; ASR consumes subsequent chunks.
             asr: Streaming ASR instance with Silero VAD endpointing.
+            timeout_s: Maximum seconds to wait for an utterance before giving
+                up and returning ``None``.
 
         Returns:
-            The first :class:`~meeting_agent.asr.Utterance` produced.
-
-        Raises:
-            RuntimeError: If the ASR stream ends without yielding an utterance.
+            The first :class:`~meeting_agent.asr.Utterance` produced, or
+            ``None`` if the timeout expires before any utterance completes.
         """
-        for utterance in asr.transcribe_stream(chunks_iter):
+        deadline = time.monotonic() + timeout_s
+
+        def _bounded_chunks() -> Iterator[AudioArray]:
+            for chunk in chunks_iter:
+                if time.monotonic() > deadline:
+                    return
+                yield chunk
+
+        for utterance in asr.transcribe_stream(_bounded_chunks()):
             return utterance
-        raise RuntimeError("ASR stream ended without producing an utterance")
+        return None  # iterator exhausted (timeout) before any utterance
 
     def _drain_echo(self, chunks_iter: Iterator[AudioArray], duration_s: float) -> None:
         """Discard ``duration_s`` seconds of chunks from the iterator.

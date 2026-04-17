@@ -571,6 +571,88 @@ def test_drain_echo_stops_cleanly_when_iterator_exhausts():
     assert list(chunks) == []
 
 
+# ---------------------------------------------------------------------------
+# V1.5: _collect_utterance timeout
+# ---------------------------------------------------------------------------
+
+
+def test_collect_utterance_returns_none_on_timeout():
+    """_collect_utterance returns None when no utterance arrives within timeout_s."""
+
+    def _no_utterance_transcribe(chunks_iter: Iterator[np.ndarray]) -> Iterator[Utterance]:
+        # Consume all chunks until the bounded iterator exhausts (deadline reached),
+        # then return without yielding any utterance.
+        for _ in chunks_iter:
+            pass
+        yield from ()  # makes this a generator that yields nothing
+
+    mock_asr = MagicMock()
+    mock_asr.transcribe_stream.side_effect = _no_utterance_transcribe
+
+    pipeline = Pipeline(PipelineConfig())
+    t_start = time.monotonic()
+    result = pipeline._collect_utterance(_infinite_chunks(), mock_asr, timeout_s=0.1)
+    elapsed = time.monotonic() - t_start
+
+    assert result is None
+    # Should have waited roughly timeout_s then returned (not hung indefinitely).
+    assert elapsed < 5.0
+
+
+def test_collect_utterance_returns_utterance_before_timeout():
+    """_collect_utterance returns the first utterance when it arrives before timeout."""
+    expected = Utterance(text="real speech", start_s=0.0, end_s=1.0)
+
+    def _immediate_transcribe(chunks_iter: Iterator[np.ndarray]) -> Iterator[Utterance]:
+        # Consume one chunk then immediately yield an utterance.
+        next(chunks_iter, None)
+        yield expected
+
+    mock_asr = MagicMock()
+    mock_asr.transcribe_stream.side_effect = _immediate_transcribe
+
+    pipeline = Pipeline(PipelineConfig())
+    result = pipeline._collect_utterance(_infinite_chunks(), mock_asr, timeout_s=5.0)
+
+    assert result == expected
+
+
+def test_run_loop_continues_after_timeout():
+    """When _collect_utterance returns None, run() loops back to wake without calling LLM/TTS."""
+    detect_count: list[int] = [0]
+
+    def _two_wake_detect(chunk: np.ndarray) -> bool:
+        n = detect_count[0]
+        detect_count[0] += 1
+        if n == 0:
+            return True  # trigger wake on first chunk
+        if n == 1:
+            raise KeyboardInterrupt  # exit cleanly on second listen cycle
+        return False
+
+    mock_wake = MagicMock()
+    mock_wake.detect.side_effect = _two_wake_detect
+
+    mock_asr = MagicMock()
+    mock_llm = MagicMock()
+    mock_tts = MagicMock()
+
+    with (
+        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+        patch("meeting_agent.pipeline.WakeDetector", return_value=mock_wake),
+        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+        patch("meeting_agent.audio.play"),
+        patch.object(Pipeline, "_collect_utterance", return_value=None),
+    ):
+        Pipeline(PipelineConfig()).run()
+
+    # LLM and TTS must not be called when there was no utterance.
+    mock_llm.respond_stream.assert_not_called()
+    mock_tts.stream_synthesize.assert_not_called()
+
+
 def test_keyboard_interrupt_exits_cleanly():
     """run() returns normally (does not raise) when Ctrl-C is received."""
     detect_count: list[int] = [0]
