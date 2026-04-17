@@ -1,7 +1,16 @@
 # CLAUDE.md — meeting-agent
 
 Real-time AI meeting participant. Read [README.md](README.md) first for the project
-vision, the north-star roadmap, and the hard "audio stays on-device" constraint.
+vision and the hard "audio stays on-device" constraint.
+
+## Living roadmap
+
+Project-level roadmap (V1 → V1.5 → V2 → V3, with stage scope, dependencies, and
+current status) lives as a GTD note on the meeting-agent project. Read it before
+starting new work — and update it before (not after) starting a new stage.
+
+- **GTD note id:** `a3f8eecb-7871-4c6e-8d9a-c838182d6007` — *"meeting-agent — living roadmap"*
+- Retrieve with `mcp__agent-gtd__get_note` (or `list_notes` for the meeting-agent project).
 
 ## Quick orientation
 
