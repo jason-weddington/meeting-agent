@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.6.0 (2026-04-17)
+
+### Features
+
+- **tts**: Swap PyTorch-MPS Kokoro backend to mlx-audio MLX-native
+  ([`ef5e9ae`](https://github.com/repos/meeting-agent/commit/ef5e9ae0c38660a33732baafed3260e57478a6d6))
+
+
 ## v0.5.0 (2026-04-16)
 
 ### Features
