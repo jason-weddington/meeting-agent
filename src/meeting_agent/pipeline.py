@@ -25,6 +25,9 @@ from meeting_agent.wake import WakeDetector
 
 _metrics = logging.getLogger("meeting_agent.metrics")
 
+_CHUNK_MS = 100
+_ECHO_TAIL_S = 0.5  # extra drain time past playback to flush speaker echo
+
 
 @dataclass
 class PipelineConfig:
@@ -85,7 +88,15 @@ class Pipeline:
                 # Stage 3: stream LLM response, pipeline TTS, play audio.
                 # Mic is implicitly gated here: chunks_iter is not read while
                 # _stream_and_play is executing, so wake detection is suspended.
+                t_speak_start = time.monotonic()
                 full_response = self._stream_and_play(config, conversation, llm, tts, t_asr_done)
+                speak_duration = time.monotonic() - t_speak_start
+
+                # Stage 4: flush the mic-queue backlog of the agent's own voice
+                # before returning to wake-word listening. Without this, the
+                # next _wait_for_wake call processes buffered echo and triggers
+                # on the agent's previous response — a feedback loop.
+                self._drain_echo(chunks_iter, speak_duration + _ECHO_TAIL_S)
 
                 # Commit the completed exchange to the rolling transcript.
                 conversation.older_turns.append(Turn(speaker="user", text=utterance.text))
@@ -141,6 +152,24 @@ class Pipeline:
         for utterance in asr.transcribe_stream(chunks_iter):
             return utterance
         raise RuntimeError("ASR stream ended without producing an utterance")
+
+    def _drain_echo(self, chunks_iter: Iterator[AudioArray], duration_s: float) -> None:
+        """Discard ``duration_s`` seconds of chunks from the iterator.
+
+        The mic-capture queue inside :func:`audio.record_chunks` keeps filling
+        while the agent speaks (the callback runs regardless of consumption).
+        After agent playback ends, that backlog is full of the agent's own
+        audio captured via the speakers. Reading it into the wake detector
+        produces a feedback loop: the agent hears itself, triggers wake, and
+        transcribes its prior response as the user's turn.
+
+        This drains the backlog plus a small tail to cover residual echo.
+        Assumes 100 ms chunks (as configured in :meth:`run`). The backlog
+        chunks pop immediately; only the tail chunks block on the queue.
+        """
+        n_chunks = max(1, int(duration_s * 1000 / _CHUNK_MS))
+        for _ in range(n_chunks):
+            next(chunks_iter, None)
 
     def _stream_and_play(
         self,

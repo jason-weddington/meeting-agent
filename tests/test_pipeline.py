@@ -537,6 +537,40 @@ def test_mic_gating_during_speech():
 # ---------------------------------------------------------------------------
 
 
+def test_drain_echo_consumes_expected_chunk_count():
+    """_drain_echo consumes duration_s / chunk_ms chunks from the iterator."""
+    pipeline = Pipeline(PipelineConfig())
+    chunks = iter([np.zeros(1600, dtype=np.float32) for _ in range(50)])
+
+    # 1.5 s at 100 ms/chunk → 15 chunks drained
+    pipeline._drain_echo(chunks, 1.5)
+
+    remaining = list(chunks)
+    assert len(remaining) == 35
+
+
+def test_drain_echo_minimum_one_chunk_for_short_durations():
+    """Sub-chunk durations still drain at least one chunk (never zero)."""
+    pipeline = Pipeline(PipelineConfig())
+    chunks = iter([np.zeros(1600, dtype=np.float32) for _ in range(10)])
+
+    pipeline._drain_echo(chunks, 0.02)  # 20 ms < one 100 ms chunk
+
+    remaining = list(chunks)
+    assert len(remaining) == 9
+
+
+def test_drain_echo_stops_cleanly_when_iterator_exhausts():
+    """_drain_echo using next(..., None) handles iterator exhaustion without raising."""
+    pipeline = Pipeline(PipelineConfig())
+    chunks = iter([np.zeros(1600, dtype=np.float32) for _ in range(2)])
+
+    # Asks for 10 chunks but iterator only has 2 — must not raise StopIteration
+    pipeline._drain_echo(chunks, 1.0)
+
+    assert list(chunks) == []
+
+
 def test_keyboard_interrupt_exits_cleanly():
     """run() returns normally (does not raise) when Ctrl-C is received."""
     detect_count: list[int] = [0]
