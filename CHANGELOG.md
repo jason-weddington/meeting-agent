@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.4.0 (2026-04-16)
+
+### Features
+
+- **llm**: Implement BedrockClient.respond_stream with prompt caching
+  ([`4cf4e23`](https://github.com/repos/meeting-agent/commit/4cf4e23eb5e934721f5c57dc79f6153bffd04f2b))
+
+
 ## v0.3.0 (2026-04-16)
 
 ### Features
