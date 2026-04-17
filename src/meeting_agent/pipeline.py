@@ -19,6 +19,7 @@ class PipelineConfig:
     input_device: int | None = None
     output_device: int | None = None
     wake_phrase: str = "hey_jarvis"
+    model_id: str = "us.anthropic.claude-sonnet-4-6"
     asr_initial_prompt: str | None = None
     context: ProjectContext = field(default_factory=lambda: ProjectContext(system_prompt=""))
 

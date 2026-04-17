@@ -19,6 +19,9 @@ dependencies = [
 ]
 
 
+[project.scripts]
+meeting-agent = "meeting_agent.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -57,7 +60,7 @@ select = [
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S106", "D"]
+"tests/**" = ["S101", "S106", "S108", "D"]
 
 [tool.mypy]
 python_version = "3.13"
@@ -98,7 +101,7 @@ source = ["meeting_agent"]
 [tool.coverage.report]
 # Coverage threshold ratchets up as modules gain tests. Keep honest —
 # do not lower past the measured floor.
-fail_under = 89
+fail_under = 98
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
