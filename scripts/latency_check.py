@@ -69,19 +69,19 @@ def asr_check(seconds: float) -> None:
 
 def tts_check(sentence: str) -> None:
     """Synthesize a sentence and measure time-to-first-audio and total time."""
-    from kokoro import KPipeline
+    from mlx_audio.tts.utils import load_model
 
-    print("loading kokoro (first run downloads ~330MB)...")
-    pipeline = KPipeline(lang_code="a")  # 'a' = American English
+    print("loading mlx-audio kokoro (first run downloads ~330MB)...")
+    model = load_model("mlx-community/Kokoro-82M-bf16")
 
     # Warmup to exclude model load from measurements.
-    for _ in pipeline("warmup.", voice=KOKORO_VOICE):
+    for _ in model.generate(text="warmup.", voice=KOKORO_VOICE, lang_code="a", speed=1.0):
         break
 
     t0 = time.perf_counter()
     first_chunk_time: float | None = None
     chunks: list[np.ndarray] = []
-    for result in pipeline(sentence, voice=KOKORO_VOICE):
+    for result in model.generate(text=sentence, voice=KOKORO_VOICE, lang_code="a", speed=1.0):
         if result.audio is None:
             continue
         if first_chunk_time is None:
