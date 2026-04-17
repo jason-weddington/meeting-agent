@@ -113,8 +113,10 @@ class Pipeline:
         Returns:
             Monotonic timestamp of the wake detection event.
         """
+        print(f"Listening for wake phrase ({self.config.wake_phrase!r})...", flush=True)
         for chunk in chunks_iter:
             if wake.detect(chunk):
+                print("Wake detected. Listening for your question...", flush=True)
                 return time.monotonic()
         return time.monotonic()  # iterator exhausted (edge case / tests)
 
