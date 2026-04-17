@@ -8,6 +8,7 @@ authors = [
     { name = "Jason Weddington", email = "jason-weddington@users.noreply.github.com" },
 ]
 dependencies = [
+    "boto3>=1.42.90",
     "kokoro>=0.9.4",
     "mlx-whisper>=0.4.3",
     "numpy>=2.4.4",
@@ -30,6 +31,7 @@ dev = [
     "pytest-cov>=6.0",
     "mypy>=1.14",
     "python-semantic-release>=9.0",
+    "boto3-stubs[bedrock-runtime]>=1.42.90",
 ]
 
 [tool.ruff]
@@ -82,7 +84,7 @@ source = ["meeting_agent"]
 [tool.coverage.report]
 # Coverage threshold ratchets up as modules gain tests. Keep honest —
 # do not lower past the measured floor.
-fail_under = 56
+fail_under = 71
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]

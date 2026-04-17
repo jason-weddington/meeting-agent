@@ -9,6 +9,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+import boto3
+
+if TYPE_CHECKING:
+    from mypy_boto3_bedrock_runtime import BedrockRuntimeClient
 
 DEFAULT_MODEL_ID: str = "us.anthropic.claude-sonnet-4-6"
 DEFAULT_REGION: str = "us-west-2"
@@ -70,6 +76,13 @@ class BedrockClient:
         """Store config; the boto3 client is lazy-created on first request."""
         self.model_id = model_id
         self.region = region
+        self._client: BedrockRuntimeClient | None = None
+
+    def _get_client(self) -> BedrockRuntimeClient:
+        """Return the boto3 bedrock-runtime client, creating it if needed."""
+        if self._client is None:
+            self._client = boto3.client("bedrock-runtime", region_name=self.region)
+        return self._client
 
     def respond_stream(
         self,
@@ -81,5 +94,52 @@ class BedrockClient:
         Callers should split deltas on sentence boundaries (``.``, ``?``,
         ``!``) before feeding them to ``tts.TTS.stream_synthesize`` for
         low-latency playback.
+
+        Raises:
+            ValueError: If ``conversation.latest_turn`` is ``None``.
         """
-        raise NotImplementedError
+        if conversation.latest_turn is None:
+            raise ValueError("Conversation.latest_turn must be set")
+
+        system_text = "\n\n".join(
+            filter(
+                None,
+                [
+                    context.system_prompt,
+                    context.agenda,
+                    context.project_docs,
+                    context.decision_log,
+                    context.stakeholders,
+                ],
+            )
+        )
+
+        older_text = "\n".join(f"{t.speaker}: {t.text}" for t in conversation.older_turns)
+        latest_text = f"{conversation.latest_turn.speaker}: {conversation.latest_turn.text}"
+
+        request = {
+            "modelId": self.model_id,
+            "system": [
+                {"text": system_text},
+                {"cachePoint": {"type": "default", "ttl": "1h"}},
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"text": older_text or " "},  # empty string rejected; use space
+                        {"cachePoint": {"type": "default", "ttl": "5m"}},
+                        {"text": latest_text},
+                    ],
+                },
+            ],
+        }
+
+        client = self._get_client()
+        response = client.converse_stream(**request)  # type: ignore[arg-type]
+
+        for event in response["stream"]:
+            if "contentBlockDelta" in event:
+                delta = event["contentBlockDelta"]["delta"]
+                if "text" in delta:
+                    yield delta["text"]
