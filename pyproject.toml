@@ -67,6 +67,10 @@ disallow_untyped_defs = false
 module = "kokoro"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = "sounddevice"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 markers = [
     "integration: end-to-end tests that require real model downloads; run with -m integration",
@@ -76,9 +80,9 @@ markers = [
 source = ["meeting_agent"]
 
 [tool.coverage.report]
-# Coverage threshold reflects only tts.py having tests so far (28% = 35/124 stmts).
-# Future PRs must ratchet this value up as more modules gain coverage.
-fail_under = 28
+# Coverage threshold ratchets up as modules gain tests. Keep honest —
+# do not lower past the measured floor.
+fail_under = 56
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
