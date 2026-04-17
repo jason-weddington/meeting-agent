@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.7.0 (2026-04-17)
+
+### Features
+
+- **asr**: Implement streaming Whisper + Silero VAD + custom vocab
+  ([`03b3aa2`](https://github.com/repos/meeting-agent/commit/03b3aa22024c8afdf69e1406e1be074e9ae27b9d))
+
+
 ## v0.6.0 (2026-04-17)
 
 ### Features
