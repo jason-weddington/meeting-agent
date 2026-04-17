@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import boto3
 
@@ -48,9 +48,9 @@ class Turn:
 class Conversation:
     """Rolling transcript for one meeting.
 
-    ``older_turns`` is cached behind a 5-minute breakpoint; ``latest_turn``
-    is uncached and rewritten each request. The split point should advance
-    only when the older-turns window has grown enough to re-anchor the cache.
+    ``older_turns`` holds completed exchanges; ``latest_turn`` is the current
+    user utterance. The Bedrock Converse API sees these as native multi-turn
+    messages — not flat text with speaker labels.
     """
 
     older_turns: list[Turn] = field(default_factory=list)
@@ -62,7 +62,7 @@ class BedrockClient:
 
     Responsibilities:
       * Assemble the ``converse_stream`` request with correct ``cachePoint``
-        placement (1h block before 5m block, both ≥ the model's min tokens).
+        placement (1h block on the system prompt).
       * Stream text deltas out as a ``str`` iterator for the TTS pipeline.
       * Expose cache-hit metrics from the response so the pipeline can log
         effective TTFT.
@@ -97,9 +97,15 @@ class BedrockClient:
 
         Raises:
             ValueError: If ``conversation.latest_turn`` is ``None``.
+            ValueError: If ``conversation.latest_turn.speaker`` is not ``"user"``.
+            ValueError: If any turn in ``conversation.older_turns`` has an unknown speaker.
         """
         if conversation.latest_turn is None:
             raise ValueError("Conversation.latest_turn must be set")
+        if conversation.latest_turn.speaker != "user":
+            raise ValueError(
+                f"latest_turn must be from 'user' speaker, got {conversation.latest_turn.speaker!r}"
+            )
 
         system_text = "\n\n".join(
             filter(
@@ -114,8 +120,24 @@ class BedrockClient:
             )
         )
 
-        older_text = "\n".join(f"{t.speaker}: {t.text}" for t in conversation.older_turns)
-        latest_text = f"{conversation.latest_turn.speaker}: {conversation.latest_turn.text}"
+        messages: list[dict[str, Any]] = []
+        for turn in conversation.older_turns:
+            if turn.speaker == "user":
+                role = "user"
+            elif turn.speaker == "agent":
+                role = "assistant"
+            else:
+                raise ValueError(
+                    f"Unknown speaker {turn.speaker!r} in older_turns; expected 'user' or 'agent'"
+                )
+            messages.append({"role": role, "content": [{"text": turn.text}]})
+
+        messages.append(
+            {
+                "role": "user",
+                "content": [{"text": conversation.latest_turn.text}],
+            }
+        )
 
         request = {
             "modelId": self.model_id,
@@ -123,16 +145,7 @@ class BedrockClient:
                 {"text": system_text},
                 {"cachePoint": {"type": "default", "ttl": "1h"}},
             ],
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"text": older_text or " "},  # empty string rejected; use space
-                        {"cachePoint": {"type": "default", "ttl": "5m"}},
-                        {"text": latest_text},
-                    ],
-                },
-            ],
+            "messages": messages,
         }
 
         client = self._get_client()

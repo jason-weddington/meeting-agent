@@ -1,4 +1,4 @@
-"""Unit tests for meeting_agent.llm — BedrockClient with prompt caching."""
+"""Unit tests for meeting_agent.llm — BedrockClient with native multi-turn messages."""
 
 from __future__ import annotations
 
@@ -32,25 +32,12 @@ def _make_client_mock(stream_response):
 
 
 # ---------------------------------------------------------------------------
-# Request shape tests
+# System block tests
 # ---------------------------------------------------------------------------
 
 
-def test_request_model_id():
-    """converse_stream is called with the correct modelId."""
-    mock_client = _make_client_mock(_make_stream("hi"))
-    with patch("boto3.client", return_value=mock_client):
-        client = BedrockClient(model_id="us.anthropic.claude-sonnet-4-6")
-        context = ProjectContext(system_prompt="You are a helpful assistant.")
-        conversation = Conversation(latest_turn=Turn(speaker="User", text="Hello"))
-        list(client.respond_stream(context, conversation))
-
-    call_kwargs = mock_client.converse_stream.call_args[1]
-    assert call_kwargs["modelId"] == "us.anthropic.claude-sonnet-4-6"
-
-
-def test_system_block_structure():
-    """system has exactly 2 entries: text block then 1h cachePoint."""
+def test_respond_stream_system_block_has_1h_cachepoint():
+    """system is a 2-element list: text block with all fields, then 1h cachePoint."""
     mock_client = _make_client_mock(_make_stream("ok"))
     with patch("boto3.client", return_value=mock_client):
         client = BedrockClient()
@@ -61,7 +48,7 @@ def test_system_block_structure():
             decision_log="Decision: use Python.",
             stakeholders="Alice, Bob",
         )
-        conversation = Conversation(latest_turn=Turn(speaker="User", text="Hi"))
+        conversation = Conversation(latest_turn=Turn(speaker="user", text="Hi"))
         list(client.respond_stream(context, conversation))
 
     system = mock_client.converse_stream.call_args[1]["system"]
@@ -89,58 +76,151 @@ def test_system_text_joins_non_empty_fields_only():
             system_prompt="Be concise.",
             # agenda, project_docs, decision_log, stakeholders all empty
         )
-        conversation = Conversation(latest_turn=Turn(speaker="User", text="Hi"))
+        conversation = Conversation(latest_turn=Turn(speaker="user", text="Hi"))
         list(client.respond_stream(context, conversation))
 
     system = mock_client.converse_stream.call_args[1]["system"]
     assert system[0]["text"] == "Be concise."
 
 
-def test_messages_content_order():
-    """messages[0].content is: text(older_turns) -> cachePoint(5m) -> text(latest_turn)."""
+# ---------------------------------------------------------------------------
+# Messages shape tests
+# ---------------------------------------------------------------------------
+
+
+def test_respond_stream_no_5m_cachepoint_in_messages():
+    """No content block anywhere in messages contains a cachePoint key."""
     mock_client = _make_client_mock(_make_stream("reply"))
     with patch("boto3.client", return_value=mock_client):
         client = BedrockClient()
         context = ProjectContext(system_prompt="Be helpful.")
         conversation = Conversation(
             older_turns=[
-                Turn(speaker="Alice", text="Hello"),
-                Turn(speaker="Bob", text="Hi there"),
+                Turn(speaker="user", text="Hello"),
+                Turn(speaker="agent", text="Hi there"),
             ],
-            latest_turn=Turn(speaker="Alice", text="What's the status?"),
+            latest_turn=Turn(speaker="user", text="What's the status?"),
         )
         list(client.respond_stream(context, conversation))
 
-    content = mock_client.converse_stream.call_args[1]["messages"][0]["content"]
-    assert len(content) == 3
-
-    # First: text with older turns
-    assert "text" in content[0]
-    assert "Alice: Hello" in content[0]["text"]
-    assert "Bob: Hi there" in content[0]["text"]
-
-    # Second: cachePoint with 5m TTL
-    assert content[1] == {"cachePoint": {"type": "default", "ttl": "5m"}}
-
-    # Third: text with latest turn
-    assert "text" in content[2]
-    assert "Alice: What's the status?" in content[2]["text"]
+    messages = mock_client.converse_stream.call_args[1]["messages"]
+    for msg in messages:
+        for block in msg["content"]:
+            assert "cachePoint" not in block, f"Unexpected cachePoint in message content: {block}"
 
 
-def test_messages_older_turns_empty_uses_space():
-    """When older_turns is empty, the text block uses a single space (not empty string)."""
+def test_respond_stream_first_turn_messages_shape():
+    """With older_turns=[] and a user latest_turn, messages is exactly one user message."""
     mock_client = _make_client_mock(_make_stream("reply"))
     with patch("boto3.client", return_value=mock_client):
         client = BedrockClient()
         context = ProjectContext(system_prompt="Be helpful.")
         conversation = Conversation(
             older_turns=[],
-            latest_turn=Turn(speaker="User", text="First message"),
+            latest_turn=Turn(speaker="user", text="First message"),
         )
         list(client.respond_stream(context, conversation))
 
-    content = mock_client.converse_stream.call_args[1]["messages"][0]["content"]
-    assert content[0]["text"] == " "
+    messages = mock_client.converse_stream.call_args[1]["messages"]
+    assert messages == [{"role": "user", "content": [{"text": "First message"}]}]
+
+
+def test_respond_stream_multi_turn_messages_shape():
+    """Multi-turn older_turns map to alternating user/assistant messages."""
+    mock_client = _make_client_mock(_make_stream("reply"))
+    with patch("boto3.client", return_value=mock_client):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(
+            older_turns=[
+                Turn(speaker="user", text="q1"),
+                Turn(speaker="agent", text="a1"),
+                Turn(speaker="user", text="q2"),
+                Turn(speaker="agent", text="a2"),
+            ],
+            latest_turn=Turn(speaker="user", text="q3"),
+        )
+        list(client.respond_stream(context, conversation))
+
+    messages = mock_client.converse_stream.call_args[1]["messages"]
+    assert messages == [
+        {"role": "user", "content": [{"text": "q1"}]},
+        {"role": "assistant", "content": [{"text": "a1"}]},
+        {"role": "user", "content": [{"text": "q2"}]},
+        {"role": "assistant", "content": [{"text": "a2"}]},
+        {"role": "user", "content": [{"text": "q3"}]},
+    ]
+
+
+def test_respond_stream_speaker_agent_maps_to_assistant():
+    """A Turn(speaker='agent', ...) in older_turns becomes role: 'assistant'."""
+    mock_client = _make_client_mock(_make_stream("reply"))
+    with patch("boto3.client", return_value=mock_client):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(
+            older_turns=[Turn(speaker="agent", text="I am the agent.")],
+            latest_turn=Turn(speaker="user", text="Tell me more"),
+        )
+        list(client.respond_stream(context, conversation))
+
+    messages = mock_client.converse_stream.call_args[1]["messages"]
+    # First message should be the agent turn mapped to assistant
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["content"] == [{"text": "I am the agent."}]
+
+
+def test_respond_stream_default_model_id():
+    """The assembled request uses the default model ID."""
+    mock_client = _make_client_mock(_make_stream("hi"))
+    with patch("boto3.client", return_value=mock_client):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="You are a helpful assistant.")
+        conversation = Conversation(latest_turn=Turn(speaker="user", text="Hello"))
+        list(client.respond_stream(context, conversation))
+
+    call_kwargs = mock_client.converse_stream.call_args[1]
+    assert call_kwargs["modelId"] == "us.anthropic.claude-sonnet-4-6"
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+
+def test_respond_stream_raises_on_none_latest_turn():
+    """respond_stream raises ValueError when conversation.latest_turn is None."""
+    client = BedrockClient()
+    context = ProjectContext(system_prompt="Be helpful.")
+    conversation = Conversation(latest_turn=None)
+
+    with pytest.raises(ValueError, match="latest_turn"):
+        list(client.respond_stream(context, conversation))
+
+
+def test_respond_stream_raises_on_non_user_latest_turn():
+    """respond_stream raises ValueError when latest_turn speaker is not 'user'."""
+    client = BedrockClient()
+    context = ProjectContext(system_prompt="Be helpful.")
+    conversation = Conversation(latest_turn=Turn(speaker="agent", text="I speak"))
+
+    with pytest.raises(ValueError, match="latest_turn"):
+        list(client.respond_stream(context, conversation))
+
+
+def test_respond_stream_raises_on_unknown_older_speaker():
+    """respond_stream raises ValueError when an older_turn has an unknown speaker."""
+    mock_client = _make_client_mock(_make_stream("reply"))
+    with patch("boto3.client", return_value=mock_client):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(
+            older_turns=[Turn(speaker="system", text="Do something")],
+            latest_turn=Turn(speaker="user", text="Hi"),
+        )
+
+        with pytest.raises(ValueError, match="system"):
+            list(client.respond_stream(context, conversation))
 
 
 # ---------------------------------------------------------------------------
@@ -154,13 +234,13 @@ def test_respond_stream_yields_text_deltas():
     with patch("boto3.client", return_value=mock_client):
         client = BedrockClient()
         context = ProjectContext(system_prompt="Be helpful.")
-        conversation = Conversation(latest_turn=Turn(speaker="User", text="Hi"))
+        conversation = Conversation(latest_turn=Turn(speaker="user", text="Hi"))
         result = list(client.respond_stream(context, conversation))
 
     assert result == ["hello", " world"]
 
 
-def test_respond_stream_skips_non_delta_events():
+def test_respond_stream_skips_non_content_block_delta_events():
     """respond_stream skips events that aren't contentBlockDelta."""
     extra_events = [
         {"messageStop": {"stopReason": "end_turn"}},
@@ -171,7 +251,7 @@ def test_respond_stream_skips_non_delta_events():
     with patch("boto3.client", return_value=mock_client):
         client = BedrockClient()
         context = ProjectContext(system_prompt="Be helpful.")
-        conversation = Conversation(latest_turn=Turn(speaker="User", text="Hi"))
+        conversation = Conversation(latest_turn=Turn(speaker="user", text="Hi"))
         result = list(client.respond_stream(context, conversation))
 
     assert result == ["hello", " world"]
@@ -187,25 +267,10 @@ def test_respond_stream_skips_non_text_delta():
     with patch("boto3.client", return_value=mock_client):
         client = BedrockClient()
         context = ProjectContext(system_prompt="Be helpful.")
-        conversation = Conversation(latest_turn=Turn(speaker="User", text="Hi"))
+        conversation = Conversation(latest_turn=Turn(speaker="user", text="Hi"))
         result = list(client.respond_stream(context, conversation))
 
     assert result == ["actual text"]
-
-
-# ---------------------------------------------------------------------------
-# Error handling
-# ---------------------------------------------------------------------------
-
-
-def test_respond_stream_raises_if_latest_turn_is_none():
-    """respond_stream raises ValueError when conversation.latest_turn is None."""
-    client = BedrockClient()
-    context = ProjectContext(system_prompt="Be helpful.")
-    conversation = Conversation(latest_turn=None)
-
-    with pytest.raises(ValueError, match="latest_turn"):
-        list(client.respond_stream(context, conversation))
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +294,7 @@ def test_boto3_client_created_with_correct_region():
     with patch("boto3.client", return_value=mock_bedrock) as mock_boto3_client:
         client = BedrockClient(region="eu-west-1")
         context = ProjectContext(system_prompt="Be helpful.")
-        conversation = Conversation(latest_turn=Turn(speaker="User", text="Hello"))
+        conversation = Conversation(latest_turn=Turn(speaker="user", text="Hello"))
         list(client.respond_stream(context, conversation))
 
     mock_boto3_client.assert_called_once_with("bedrock-runtime", region_name="eu-west-1")
@@ -243,12 +308,12 @@ def test_client_reused_across_calls():
         client = BedrockClient()
         context = ProjectContext(system_prompt="Be helpful.")
 
-        conversation = Conversation(latest_turn=Turn(speaker="User", text="First"))
+        conversation = Conversation(latest_turn=Turn(speaker="user", text="First"))
         list(client.respond_stream(context, conversation))
 
         # Reset the stream for second call
         mock_bedrock.converse_stream.return_value = _make_stream("ok2")
-        conversation2 = Conversation(latest_turn=Turn(speaker="User", text="Second"))
+        conversation2 = Conversation(latest_turn=Turn(speaker="user", text="Second"))
         list(client.respond_stream(context, conversation2))
 
     # boto3.client should only be called once (lazy init)
