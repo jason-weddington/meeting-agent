@@ -9,7 +9,7 @@ authors = [
 ]
 dependencies = [
     "boto3>=1.42.90",
-    "kokoro>=0.9.4",
+    "mlx-audio>=0.2.10",
     "mlx-whisper>=0.4.3",
     "numpy>=2.4.4",
     "openwakeword>=0.4.0",
@@ -67,7 +67,7 @@ module = "tests.*"
 disallow_untyped_defs = false
 
 [[tool.mypy.overrides]]
-module = "kokoro"
+module = "mlx_audio.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
