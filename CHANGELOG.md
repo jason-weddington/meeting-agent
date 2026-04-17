@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.5.0 (2026-04-16)
+
+### Features
+
+- **wake**: Implement openwakeword wake-word detector
+  ([`540b7c2`](https://github.com/repos/meeting-agent/commit/540b7c2660550605674b73f547d21cb2ffa148b5))
+
+
 ## v0.4.0 (2026-04-16)
 
 ### Features
