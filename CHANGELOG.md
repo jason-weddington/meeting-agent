@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.9.2 (2026-04-17)
+
+### Bug Fixes
+
+- **wake**: Use wakeword_model_paths and resolve bundled names to paths
+  ([`5ec4f61`](https://github.com/repos/meeting-agent/commit/5ec4f61927fb475f4d700583b61f5f86183e0602))
+
+
 ## v0.9.1 (2026-04-17)
 
 ### Bug Fixes
