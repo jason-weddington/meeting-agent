@@ -1,6 +1,6 @@
 [project]
 name = "meeting-agent"
-version = "0.9.0"
+version = "0.9.1"
 description = "Real-time AI agent that participates in meetings"
 requires-python = ">=3.13"
 

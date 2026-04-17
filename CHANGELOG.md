@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.9.1 (2026-04-17)
+
+### Bug Fixes
+
+- **scripts**: Update latency_check.py to mlx-audio TTS API
+  ([`cdbeb2c`](https://github.com/repos/meeting-agent/commit/cdbeb2c74581ca2553bdbd343843418a7f72f53b))
+
+### Testing
+
+- Add end-to-end smoke test for full pipeline round-trip
+  ([`c9e241c`](https://github.com/repos/meeting-agent/commit/c9e241cd1743db013488b62371ab206a0cb7edec))
+
+
 ## v0.9.0 (2026-04-17)
 
 ### Features
