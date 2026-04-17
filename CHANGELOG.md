@@ -2,6 +2,30 @@
 
 <!-- version list -->
 
+## v0.9.4 (2026-04-17)
+
+### Bug Fixes
+
+- **asr, pipeline**: V1.5 robustness bundle — silence guard + VAD + timeout
+  ([`a2f26ac`](https://github.com/repos/meeting-agent/commit/a2f26ac45636b45997047d47f0a0f97f2e0736a4))
+
+- **cli**: Tune default system prompt for text-to-speech output
+  ([`dba3ea9`](https://github.com/repos/meeting-agent/commit/dba3ea9e53a80865ad1cf9be29326e8a43f9de06))
+
+- **pipeline**: Drain mic-queue backlog of agent audio to stop feedback loop
+  ([`6211aad`](https://github.com/repos/meeting-agent/commit/6211aadeff945debc5da06cfb722a6a8d325f200))
+
+### Chores
+
+- Decouple release from deploy
+  ([`af52d6c`](https://github.com/repos/meeting-agent/commit/af52d6cfd8716d7740d1e718a63321e32b6dadf5))
+
+### Documentation
+
+- **claude**: Point to GTD roadmap note
+  ([`59f8b4a`](https://github.com/repos/meeting-agent/commit/59f8b4aa79f8eeb44466818b2ab6cfbc46514215))
+
+
 ## v0.9.3 (2026-04-17)
 
 ### Bug Fixes
