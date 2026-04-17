@@ -21,3 +21,5 @@ htmlcov/
 *.swo
 *~
 .DS_Store
+
+.claude/
