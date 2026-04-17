@@ -30,14 +30,6 @@ repos:
         stages: [commit-msg]
         always_run: true
 
-      - id: semantic-release
-        name: semantic-release (post-commit on main)
-        entry: "bash -c 'branch=$(git rev-parse --abbrev-ref HEAD); msg=$(git log -1 --format=%s); if [ \"$branch\" = \"main\" ] && [[ \"$msg\" != chore\\(release\\):* ]]; then uv run semantic-release version --no-push --no-vcs-release || true; fi'"
-        language: system
-        pass_filenames: false
-        always_run: true
-        stages: [post-commit]
-
       - id: mypy
         name: mypy
         entry: uv run --frozen mypy
