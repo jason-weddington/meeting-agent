@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.3.0 (2026-04-16)
+
+### Features
+
+- **audio**: Implement mic capture and speaker playback via sounddevice
+  ([`8a595ed`](https://github.com/repos/meeting-agent/commit/8a595ed25532f46f36076ae482d77b5551c8fd66))
+
+
 ## v0.2.0 (2026-04-16)
 
 ### Chores
