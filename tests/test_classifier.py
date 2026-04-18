@@ -1,4 +1,4 @@
-"""Unit tests for meeting_agent.classifier — Haiku decision gate."""
+"""Unit tests for meeting_agent.classifier — Haiku decision gate + Ollama backend."""
 
 from __future__ import annotations
 
@@ -9,9 +9,11 @@ import botocore.exceptions
 
 from meeting_agent.asr import Utterance
 from meeting_agent.classifier import (
-    Classifier,
+    _DECISION_JSON_SCHEMA,
+    BedrockClassifier,
     Confidence,
     Decision,
+    OllamaClassifier,
     SessionState,
 )
 from meeting_agent.llm import ProjectContext, Turn
@@ -80,24 +82,35 @@ def _make_context(system_prompt: str = "You are a meeting agent.") -> ProjectCon
     return ProjectContext(system_prompt=system_prompt)
 
 
+def _make_ollama_response(speaker: str, action: str, confidence: float) -> dict:
+    """Build a fake Ollama chat response dict."""
+    import json
+
+    return {
+        "message": {
+            "content": json.dumps({"speaker": speaker, "action": action, "confidence": confidence})
+        }
+    }
+
+
 _SILENT_DECISION = Decision(speaker="unknown", action="silent", confidence=0.0)
 
 
 # ---------------------------------------------------------------------------
-# Lazy init tests
+# BedrockClassifier: lazy init tests
 # ---------------------------------------------------------------------------
 
 
 def test_init_is_cheap():
-    """Classifier() construction does not call boto3; _client is None."""
+    """BedrockClassifier() construction does not call boto3; _client is None."""
     with patch("boto3.client") as mock_boto3:
-        classifier = Classifier()
+        classifier = BedrockClassifier()
         mock_boto3.assert_not_called()
         assert classifier._client is None
 
 
 # ---------------------------------------------------------------------------
-# Request shape tests
+# BedrockClassifier: request shape tests
 # ---------------------------------------------------------------------------
 
 
@@ -106,7 +119,7 @@ def test_classify_request_shape():
     mock_client = MagicMock()
     mock_client.converse.return_value = _make_classify_response("Alice", "full_answer", 0.9)
     with patch("boto3.client", return_value=mock_client):
-        classifier = Classifier()
+        classifier = BedrockClassifier()
         context = _make_context()
         utterance = _make_utterance("Alice, what's the status?")
         confidence = _make_confidence()
@@ -144,7 +157,7 @@ def test_system_prompt_embeds_project_context():
     mock_client.converse.return_value = _make_classify_response("Bob", "silent", 0.5)
     system_prompt = "Meeting context: Q4 roadmap review. Attendees: Jason, Alice, Bob."
     with patch("boto3.client", return_value=mock_client):
-        classifier = Classifier()
+        classifier = BedrockClassifier()
         context = _make_context(system_prompt=system_prompt)
         classifier.classify(_make_utterance(), _make_confidence(), context, _make_session())
 
@@ -153,7 +166,7 @@ def test_system_prompt_embeds_project_context():
 
 
 # ---------------------------------------------------------------------------
-# Response parsing tests
+# BedrockClassifier: response parsing tests
 # ---------------------------------------------------------------------------
 
 
@@ -162,7 +175,7 @@ def test_parses_tool_use_response():
     mock_client = MagicMock()
     mock_client.converse.return_value = _make_classify_response("Aziz", "full_answer", 0.88)
     with patch("boto3.client", return_value=mock_client):
-        classifier = Classifier()
+        classifier = BedrockClassifier()
         decision = classifier.classify(
             _make_utterance(), _make_confidence(), _make_context(), _make_session()
         )
@@ -171,7 +184,7 @@ def test_parses_tool_use_response():
 
 
 # ---------------------------------------------------------------------------
-# Fail-closed tests
+# BedrockClassifier: fail-closed tests
 # ---------------------------------------------------------------------------
 
 
@@ -182,7 +195,7 @@ def test_fail_closed_on_timeout(caplog):
         endpoint_url="https://bedrock.test"
     )
     with patch("boto3.client", return_value=mock_client):
-        classifier = Classifier()
+        classifier = BedrockClassifier()
         with caplog.at_level(logging.WARNING, logger="meeting_agent.classifier"):
             decision = classifier.classify(
                 _make_utterance(), _make_confidence(), _make_context(), _make_session()
@@ -197,7 +210,7 @@ def test_fail_closed_on_boto_error(caplog):
     mock_client = MagicMock()
     mock_client.converse.side_effect = botocore.exceptions.BotoCoreError()
     with patch("boto3.client", return_value=mock_client):
-        classifier = Classifier()
+        classifier = BedrockClassifier()
         with caplog.at_level(logging.WARNING, logger="meeting_agent.classifier"):
             decision = classifier.classify(
                 _make_utterance(), _make_confidence(), _make_context(), _make_session()
@@ -218,7 +231,7 @@ def test_fail_closed_on_missing_tool_use(caplog):
         }
     }
     with patch("boto3.client", return_value=mock_client):
-        classifier = Classifier()
+        classifier = BedrockClassifier()
         with caplog.at_level(logging.WARNING, logger="meeting_agent.classifier"):
             decision = classifier.classify(
                 _make_utterance(), _make_confidence(), _make_context(), _make_session()
@@ -250,7 +263,7 @@ def test_fail_closed_on_schema_violation(caplog):
         }
     }
     with patch("boto3.client", return_value=mock_client):
-        classifier = Classifier()
+        classifier = BedrockClassifier()
         with caplog.at_level(logging.WARNING, logger="meeting_agent.classifier"):
             decision = classifier.classify(
                 _make_utterance(), _make_confidence(), _make_context(), _make_session()
@@ -261,7 +274,7 @@ def test_fail_closed_on_schema_violation(caplog):
 
 
 # ---------------------------------------------------------------------------
-# Prompt content tests
+# BedrockClassifier: prompt content tests
 # ---------------------------------------------------------------------------
 
 
@@ -271,7 +284,7 @@ def test_airtime_features_in_prompt():
     mock_client.converse.return_value = _make_classify_response("Bob", "silent", 0.5)
     session = _make_session(agent_turns_last_5min=3, agent_turns_last_30s=2)
     with patch("boto3.client", return_value=mock_client):
-        classifier = Classifier()
+        classifier = BedrockClassifier()
         classifier.classify(_make_utterance(), _make_confidence(), _make_context(), session)
 
     user_text = mock_client.converse.call_args[1]["messages"][0]["content"][0]["text"]
@@ -289,7 +302,7 @@ def test_recent_turns_in_prompt():
         agent_turns_last_30s=0,
     )
     with patch("boto3.client", return_value=mock_client):
-        classifier = Classifier()
+        classifier = BedrockClassifier()
         classifier.classify(_make_utterance(), _make_confidence(), _make_context(), session)
 
     user_text = mock_client.converse.call_args[1]["messages"][0]["content"][0]["text"]
@@ -303,7 +316,7 @@ def test_confidence_features_in_prompt():
     mock_client.converse.return_value = _make_classify_response("Alice", "silent", 0.5)
     conf = Confidence(avg_logprob=-0.5, no_speech_prob=0.2, compression_ratio=1.8)
     with patch("boto3.client", return_value=mock_client):
-        classifier = Classifier()
+        classifier = BedrockClassifier()
         classifier.classify(_make_utterance(), conf, _make_context(), _make_session())
 
     user_text = mock_client.converse.call_args[1]["messages"][0]["content"][0]["text"]
@@ -330,7 +343,7 @@ def test_classifier_logs_cache_usage(caplog):
     }
     mock_client.converse.return_value = response
     with patch("boto3.client", return_value=mock_client):
-        classifier = Classifier()
+        classifier = BedrockClassifier()
         with caplog.at_level(logging.INFO, logger="meeting_agent.classifier"):
             classifier.classify(
                 _make_utterance(), _make_confidence(), _make_context(), _make_session()
@@ -343,3 +356,203 @@ def test_classifier_logs_cache_usage(caplog):
     assert rec.output_tokens == 56
     assert rec.cache_read_tokens == 1200
     assert rec.cache_write_tokens == 0
+
+
+# ---------------------------------------------------------------------------
+# OllamaClassifier: init / defaults tests
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_init_honors_defaults():
+    """OllamaClassifier() uses DEFAULT_MODEL and DEFAULT_HOST when no args given."""
+    classifier = OllamaClassifier()
+    assert classifier.model == OllamaClassifier.DEFAULT_MODEL
+    assert classifier.host == OllamaClassifier.DEFAULT_HOST
+    assert classifier._client is None
+
+
+def test_ollama_init_honors_model_override():
+    """Custom model string is forwarded to chat(model=...)."""
+    mock_client = MagicMock()
+    mock_client.chat.return_value = _make_ollama_response("x", "silent", 0.0)
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier(model="qwen3.6:35b-a3b-mlx-bf16")
+        classifier.classify(_make_utterance(), _make_confidence(), _make_context(), _make_session())
+
+    assert mock_client.chat.call_args[1]["model"] == "qwen3.6:35b-a3b-mlx-bf16"
+
+
+def test_ollama_init_honors_host_override(monkeypatch):
+    """Explicit host wins over OLLAMA_HOST env var."""
+    monkeypatch.setenv("OLLAMA_HOST", "http://env-host:11434")
+    classifier = OllamaClassifier(host="http://explicit:11434")
+    assert classifier.host == "http://explicit:11434"
+
+
+def test_ollama_init_honors_env_host(monkeypatch):
+    """OLLAMA_HOST environment variable is used when no explicit host is given."""
+    monkeypatch.setenv("OLLAMA_HOST", "http://env-host:11434")
+    classifier = OllamaClassifier()
+    assert classifier.host == "http://env-host:11434"
+
+
+# ---------------------------------------------------------------------------
+# OllamaClassifier: request shape tests
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_chat_receives_full_prompts():
+    """classify() sends system and user messages built from prompt helpers."""
+    mock_client = MagicMock()
+    mock_client.chat.return_value = _make_ollama_response("Alice", "full_answer", 0.9)
+    context = _make_context("Q4 roadmap attendees: Jason, Alice.")
+    utterance = _make_utterance("Alice, what's the status?")
+
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier()
+        classifier.classify(utterance, _make_confidence(), context, _make_session())
+
+    call_kwargs = mock_client.chat.call_args[1]
+    messages = call_kwargs["messages"]
+    system_msg = next(m for m in messages if m["role"] == "system")
+    user_msg = next(m for m in messages if m["role"] == "user")
+
+    assert "Q4 roadmap attendees: Jason, Alice." in system_msg["content"]
+    assert "Alice, what's the status?" in user_msg["content"]
+
+
+def test_ollama_format_schema_passed():
+    """classify() passes _DECISION_JSON_SCHEMA as the format= argument."""
+    mock_client = MagicMock()
+    mock_client.chat.return_value = _make_ollama_response("x", "silent", 0.0)
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier()
+        classifier.classify(_make_utterance(), _make_confidence(), _make_context(), _make_session())
+
+    call_kwargs = mock_client.chat.call_args[1]
+    assert call_kwargs["format"] == _DECISION_JSON_SCHEMA
+    assert "speaker" in call_kwargs["format"]["properties"]
+    assert "action" in call_kwargs["format"]["properties"]
+    assert "confidence" in call_kwargs["format"]["properties"]
+
+
+def test_ollama_temperature_zero_and_num_predict():
+    """classify() passes temperature=0.0 and num_predict=256 in options."""
+    mock_client = MagicMock()
+    mock_client.chat.return_value = _make_ollama_response("x", "silent", 0.0)
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier()
+        classifier.classify(_make_utterance(), _make_confidence(), _make_context(), _make_session())
+
+    options = mock_client.chat.call_args[1]["options"]
+    assert options["temperature"] == 0.0
+    assert options["num_predict"] == 256
+
+
+# ---------------------------------------------------------------------------
+# OllamaClassifier: response parsing tests
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_parses_decision_from_response():
+    """Valid JSON response is parsed into the correct Decision."""
+    mock_client = MagicMock()
+    mock_client.chat.return_value = _make_ollama_response("Alice", "full_answer", 0.92)
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier()
+        decision = classifier.classify(
+            _make_utterance(), _make_confidence(), _make_context(), _make_session()
+        )
+
+    assert decision == Decision(speaker="Alice", action="full_answer", confidence=0.92)
+
+
+# ---------------------------------------------------------------------------
+# OllamaClassifier: fail-closed tests
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_fail_closed_on_connection_error(caplog):
+    """Connection error returns a silent Decision and logs a warning."""
+    mock_client = MagicMock()
+    mock_client.chat.side_effect = OSError("Connection refused")
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier()
+        with caplog.at_level(logging.WARNING, logger="meeting_agent.classifier"):
+            decision = classifier.classify(
+                _make_utterance(), _make_confidence(), _make_context(), _make_session()
+            )
+
+    assert decision == _SILENT_DECISION
+    assert caplog.records, "Expected at least one warning log entry"
+
+
+def test_ollama_fail_closed_on_timeout(caplog):
+    """Timeout error returns a silent Decision and logs a warning."""
+    mock_client = MagicMock()
+    mock_client.chat.side_effect = TimeoutError("Request timed out")
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier()
+        with caplog.at_level(logging.WARNING, logger="meeting_agent.classifier"):
+            decision = classifier.classify(
+                _make_utterance(), _make_confidence(), _make_context(), _make_session()
+            )
+
+    assert decision == _SILENT_DECISION
+    assert caplog.records, "Expected at least one warning log entry"
+
+
+def test_ollama_fail_closed_on_malformed_json(caplog):
+    """Non-JSON response content returns a silent Decision and logs a warning."""
+    mock_client = MagicMock()
+    mock_client.chat.return_value = {"message": {"content": "not valid json {{{"}}
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier()
+        with caplog.at_level(logging.WARNING, logger="meeting_agent.classifier"):
+            decision = classifier.classify(
+                _make_utterance(), _make_confidence(), _make_context(), _make_session()
+            )
+
+    assert decision == _SILENT_DECISION
+    assert caplog.records, "Expected at least one warning log entry"
+
+
+def test_ollama_fail_closed_on_schema_violation(caplog):
+    """JSON response missing required 'action' field returns a silent Decision."""
+    import json
+
+    mock_client = MagicMock()
+    # Missing "action" field
+    mock_client.chat.return_value = {
+        "message": {"content": json.dumps({"speaker": "Alice", "confidence": 0.9})}
+    }
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier()
+        with caplog.at_level(logging.WARNING, logger="meeting_agent.classifier"):
+            decision = classifier.classify(
+                _make_utterance(), _make_confidence(), _make_context(), _make_session()
+            )
+
+    assert decision == _SILENT_DECISION
+    assert caplog.records, "Expected at least one warning log entry"
+
+
+def test_ollama_fail_closed_on_unknown_action_value(caplog):
+    """JSON with an unknown action enum value returns a silent Decision."""
+    import json
+
+    mock_client = MagicMock()
+    mock_client.chat.return_value = {
+        "message": {
+            "content": json.dumps({"speaker": "Alice", "action": "wiggle", "confidence": 0.9})
+        }
+    }
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier()
+        with caplog.at_level(logging.WARNING, logger="meeting_agent.classifier"):
+            decision = classifier.classify(
+                _make_utterance(), _make_confidence(), _make_context(), _make_session()
+            )
+
+    assert decision == _SILENT_DECISION
+    assert caplog.records, "Expected at least one warning log entry"

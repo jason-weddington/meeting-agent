@@ -285,7 +285,7 @@ def test_v2_classifier_gated_pipeline(
                 # cold-load a second Kokoro model.
                 patch("meeting_agent.pipeline.TTS", return_value=tts_instance),
                 patch("meeting_agent.pipeline.BedrockClient") as mock_llm_cls,
-                patch("meeting_agent.pipeline.Classifier") as mock_classifier_cls,
+                patch("meeting_agent.pipeline._build_classifier") as mock_build_cls,
             ):
                 mock_llm_instance = MagicMock()
                 mock_llm_instance.respond_stream.side_effect = mock_respond_stream
@@ -293,7 +293,7 @@ def test_v2_classifier_gated_pipeline(
 
                 mock_classifier_instance = MagicMock()
                 mock_classifier_instance.classify.side_effect = mock_classify
-                mock_classifier_cls.return_value = mock_classifier_instance
+                mock_build_cls.return_value = mock_classifier_instance
 
                 # StreamingASR is NOT mocked — the real VAD + Whisper run here.
                 pipeline.run()

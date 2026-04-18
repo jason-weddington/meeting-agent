@@ -35,17 +35,34 @@ uv run python scripts/latency_check.py tts  # TTS latency smoke test
 uv run python scripts/latency_check.py asr  # ASR latency smoke test (needs mic)
 ```
 
+## Classifier backends
+
+`meeting-agent` supports two classifier backends:
+
+- **Bedrock Haiku** (default) — `--classifier-backend bedrock`
+- **Local Ollama** — `--classifier-backend ollama --classifier-model qwen3.5:35b-a3b`
+
+The Ollama backend hits a running `ollama serve` daemon. Use `--ollama-host` or
+the `OLLAMA_HOST` env var to override the default `http://localhost:11434`.
+
+Model is configurable per-run; code is unchanged:
+```bash
+uv run meeting-agent --classifier-backend ollama --classifier-model qwen3.5:35b-a3b
+uv run meeting-agent --classifier-backend ollama --classifier-model qwen3.6:35b-a3b-mlx-bf16
+```
+
 ## Module layout
 
 ```
 src/meeting_agent/
-  audio.py     # mic capture + speaker playback via sounddevice (16 kHz mono)
-  asr.py       # streaming Whisper (mlx-whisper) + Silero VAD → Utterance stream
-  tts.py       # Kokoro TTS (sentence-by-sentence streaming)
-  llm.py       # Bedrock Claude via converse_stream, with cachePoint breakpoints
-  wake.py      # openwakeword wake-word detector
-  pipeline.py  # orchestrator: wires modules; maintains rolling transcript
-  cli.py       # `meeting-agent run` entry point
+  audio.py       # mic capture + speaker playback via sounddevice (16 kHz mono)
+  asr.py         # streaming Whisper (mlx-whisper) + Silero VAD → Utterance stream
+  classifier.py  # classifier Protocol + BedrockClassifier + OllamaClassifier
+  tts.py         # Kokoro TTS (sentence-by-sentence streaming)
+  llm.py         # Bedrock Claude via converse_stream, with cachePoint breakpoints
+  wake.py        # openwakeword wake-word detector
+  pipeline.py    # orchestrator: wires modules; maintains rolling transcript
+  cli.py         # `meeting-agent run` entry point
 ```
 
 Each module is currently a stub with signatures only. Fill in the body for the

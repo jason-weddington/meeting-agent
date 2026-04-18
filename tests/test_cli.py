@@ -273,3 +273,54 @@ def test_keyboard_interrupt_is_caught_cleanly(monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "Exiting" in out
+
+
+# ---------------------------------------------------------------------------
+# Classifier backend / model / host flags
+# ---------------------------------------------------------------------------
+
+
+def test_cli_classifier_backend_defaults_to_bedrock():
+    """No --classifier-backend flag → PipelineConfig.classifier_backend == 'bedrock'."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent"])
+    config = mock_cls.call_args[0][0]
+    assert config.classifier_backend == "bedrock"
+
+
+def test_cli_classifier_backend_ollama():
+    """--classifier-backend ollama sets PipelineConfig.classifier_backend to 'ollama'."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent", "--classifier-backend", "ollama"])
+    config = mock_cls.call_args[0][0]
+    assert config.classifier_backend == "ollama"
+
+
+def test_cli_classifier_model_forwarded():
+    """--classifier-model <name> populates PipelineConfig.classifier_model."""
+    mock_cls = _run_main_with_pipeline(
+        ["meeting-agent", "--classifier-model", "qwen3.6:35b-a3b-mlx-bf16"]
+    )
+    config = mock_cls.call_args[0][0]
+    assert config.classifier_model == "qwen3.6:35b-a3b-mlx-bf16"
+
+
+def test_cli_classifier_model_defaults_to_none():
+    """No --classifier-model flag → PipelineConfig.classifier_model is None."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent"])
+    config = mock_cls.call_args[0][0]
+    assert config.classifier_model is None
+
+
+def test_cli_ollama_host_forwarded():
+    """--ollama-host <url> populates PipelineConfig.ollama_host."""
+    mock_cls = _run_main_with_pipeline(
+        ["meeting-agent", "--ollama-host", "http://example.local:11434"]
+    )
+    config = mock_cls.call_args[0][0]
+    assert config.ollama_host == "http://example.local:11434"
+
+
+def test_cli_ollama_host_defaults_to_none():
+    """No --ollama-host flag → PipelineConfig.ollama_host is None."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent"])
+    config = mock_cls.call_args[0][0]
+    assert config.ollama_host is None

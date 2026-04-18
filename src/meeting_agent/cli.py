@@ -124,6 +124,32 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Tee one-line human summaries to stderr per event (implies --trace)",
     )
+    parser.add_argument(
+        "--classifier-backend",
+        choices=["bedrock", "ollama"],
+        default="bedrock",
+        dest="classifier_backend",
+        metavar="{bedrock,ollama}",
+        help="Classifier backend to use (default: bedrock)",
+    )
+    parser.add_argument(
+        "--classifier-model",
+        default=None,
+        dest="classifier_model",
+        metavar="MODEL",
+        help=(
+            "Classifier model name. "
+            "bedrock default: us.anthropic.claude-haiku-4-5-20251001-v1:0  "
+            "ollama default: qwen3.5:35b-a3b"
+        ),
+    )
+    parser.add_argument(
+        "--ollama-host",
+        default=None,
+        dest="ollama_host",
+        metavar="URL",
+        help="Ollama daemon URL (default: OLLAMA_HOST env var or http://localhost:11434)",
+    )
 
     return parser
 
@@ -175,6 +201,9 @@ def main() -> None:
         context=context,
         trace_enabled=trace_enabled,
         trace_verbose=trace_verbose,
+        classifier_backend=args.classifier_backend,
+        classifier_model=args.classifier_model,
+        ollama_host=args.ollama_host,
     )
 
     try:

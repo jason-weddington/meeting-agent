@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from meeting_agent.asr import Utterance
-from meeting_agent.classifier import Decision
+from meeting_agent.classifier import BedrockClassifier, Decision, OllamaClassifier
 from meeting_agent.llm import Turn
 from meeting_agent.pipeline import (
     AirtimeTracker,
@@ -20,6 +20,7 @@ from meeting_agent.pipeline import (
     DeafnessProbe,
     Pipeline,
     PipelineConfig,
+    _build_classifier,
     _install_exception_log,
     _is_low_confidence,
     _split_at_sentence_boundaries,
@@ -116,7 +117,7 @@ def _run_v2_pipeline(
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
@@ -467,7 +468,7 @@ def test_silent_decision_appends_and_skips_response():
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
@@ -504,7 +505,7 @@ def test_bedrock_client_constructed_with_model_id():
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm) as MockLLM,
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
@@ -554,7 +555,7 @@ def test_deafness_probe_fires_after_threshold_drops():
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
@@ -602,7 +603,7 @@ def test_staleness_gate_downgrades_above_1_5s():
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
@@ -637,7 +638,7 @@ def test_staleness_gate_drops_above_5s():
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
@@ -680,7 +681,7 @@ def test_circuit_breaker_opens_after_3_failures():
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
@@ -730,7 +731,7 @@ def test_airtime_count_passed_to_classifier():
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
@@ -784,7 +785,7 @@ def test_multi_speaker_transcript_appended():
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
@@ -817,7 +818,7 @@ def test_keyboard_interrupt_exits_cleanly():
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
@@ -1029,3 +1030,57 @@ def test_stream_and_play_preserves_raw_text_in_transcript():
     assert raw == "Here's **what** I think."
     # TTS must have received the filtered version.
     mock_tts.stream_synthesize.assert_called_once_with("Here's what I think.")
+
+
+# ---------------------------------------------------------------------------
+# Classifier factory unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_classifier_factory_selects_bedrock_by_default():
+    """Default PipelineConfig produces a BedrockClassifier."""
+    config = PipelineConfig()
+    classifier = _build_classifier(config)
+    assert isinstance(classifier, BedrockClassifier)
+
+
+def test_classifier_factory_selects_ollama_when_configured():
+    """classifier_backend='ollama' in PipelineConfig produces an OllamaClassifier."""
+    config = PipelineConfig(classifier_backend="ollama")
+    classifier = _build_classifier(config)
+    assert isinstance(classifier, OllamaClassifier)
+
+
+def test_classifier_model_override_reaches_bedrock_backend():
+    """classifier_model override is forwarded to BedrockClassifier.model_id."""
+    config = PipelineConfig(classifier_model="us.anthropic.claude-opus-4-5")
+    classifier = _build_classifier(config)
+    assert isinstance(classifier, BedrockClassifier)
+    assert classifier.model_id == "us.anthropic.claude-opus-4-5"
+
+
+def test_classifier_model_override_reaches_ollama_backend():
+    """classifier_model override is forwarded to OllamaClassifier.model."""
+    config = PipelineConfig(
+        classifier_backend="ollama",
+        classifier_model="qwen3.6:35b-a3b-mlx-bf16",
+    )
+    classifier = _build_classifier(config)
+    assert isinstance(classifier, OllamaClassifier)
+    assert classifier.model == "qwen3.6:35b-a3b-mlx-bf16"
+
+
+def test_classifier_factory_bedrock_default_model():
+    """BedrockClassifier uses its DEFAULT_MODEL_ID when classifier_model is None."""
+    config = PipelineConfig()
+    classifier = _build_classifier(config)
+    assert isinstance(classifier, BedrockClassifier)
+    assert classifier.model_id == BedrockClassifier.DEFAULT_MODEL_ID
+
+
+def test_classifier_factory_ollama_default_model():
+    """OllamaClassifier uses its DEFAULT_MODEL when classifier_model is None."""
+    config = PipelineConfig(classifier_backend="ollama")
+    classifier = _build_classifier(config)
+    assert isinstance(classifier, OllamaClassifier)
+    assert classifier.model == OllamaClassifier.DEFAULT_MODEL

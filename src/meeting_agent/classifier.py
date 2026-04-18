@@ -1,17 +1,28 @@
-"""Haiku 4.5 classifier — gatekeeper that decides silent / hedged_answer / full_answer.
+"""Classifier backends — gatekeeper that decides silent / hedged_answer / full_answer.
 
 For each completed ``Utterance`` from ``StreamingASR``, determines who spoke and
 what the agent should do.  All exceptions fail closed to a silent ``Decision`` so
 the pipeline never blocks on a classifier failure.
+
+Two backends are provided:
+
+* :class:`BedrockClassifier` — Bedrock Haiku 4.5 via the Converse API (default).
+* :class:`OllamaClassifier` — local Ollama daemon; model name is configurable.
+
+Both satisfy the :class:`Classifier` protocol and can be swapped without changing
+the calling code.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import boto3
+import ollama
 from botocore.config import Config
 
 from meeting_agent.asr import Utterance
@@ -20,6 +31,10 @@ from meeting_agent.llm import ProjectContext, Turn
 if TYPE_CHECKING:
     from mypy_boto3_bedrock_runtime import BedrockRuntimeClient
 
+# ---------------------------------------------------------------------------
+# Module-level defaults (kept for backward compatibility with direct imports)
+# ---------------------------------------------------------------------------
+
 DEFAULT_MODEL_ID: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 DEFAULT_REGION: str = "us-west-2"
 DEFAULT_TIMEOUT_S: float = 2.0
@@ -27,6 +42,11 @@ DEFAULT_TIMEOUT_S: float = 2.0
 Action = Literal["silent", "hedged_answer", "full_answer"]
 
 _logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shared data structures
+# ---------------------------------------------------------------------------
 
 
 def _log_cache_hit(logger: logging.Logger, call: str, usage: dict[str, Any]) -> None:
@@ -85,6 +105,27 @@ class Decision:
     confidence: float
 
 
+# ---------------------------------------------------------------------------
+# Shared JSON schema — single source of truth for both backends
+# ---------------------------------------------------------------------------
+
+_DECISION_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "speaker": {
+            "type": "string",
+            "description": "Attributed speaker name from the roster, or 'unknown'.",
+        },
+        "action": {
+            "type": "string",
+            "enum": ["silent", "hedged_answer", "full_answer"],
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": ["speaker", "action", "confidence"],
+}
+
+# Bedrock tool config — wraps the shared schema in the toolSpec wire format.
 _TOOL_CONFIG: dict[str, Any] = {
     "tools": [
         {
@@ -92,33 +133,37 @@ _TOOL_CONFIG: dict[str, Any] = {
                 "name": "classify",
                 "description": "Return the classification decision for the current utterance.",
                 "inputSchema": {
-                    "json": {
-                        "type": "object",
-                        "properties": {
-                            "speaker": {
-                                "type": "string",
-                                "description": (
-                                    "Attributed speaker name from the roster, or 'unknown'."
-                                ),
-                            },
-                            "action": {
-                                "type": "string",
-                                "enum": ["silent", "hedged_answer", "full_answer"],
-                            },
-                            "confidence": {
-                                "type": "number",
-                                "minimum": 0,
-                                "maximum": 1,
-                            },
-                        },
-                        "required": ["speaker", "action", "confidence"],
-                    }
+                    "json": _DECISION_JSON_SCHEMA,
                 },
             }
         }
     ],
     "toolChoice": {"tool": {"name": "classify"}},
 }
+
+
+# ---------------------------------------------------------------------------
+# Classifier protocol
+# ---------------------------------------------------------------------------
+
+
+class Classifier(Protocol):
+    """Gatekeeper interface — decides silent / hedged_answer / full_answer per utterance."""
+
+    def classify(
+        self,
+        utterance: Utterance,
+        confidence: Confidence,
+        context: ProjectContext,
+        session: SessionState,
+    ) -> Decision:
+        """Classify one utterance and return a Decision; fail closed to silent on error."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Shared prompt builders (used by both backends unchanged)
+# ---------------------------------------------------------------------------
 
 
 def _build_system_prompt(context: ProjectContext) -> str:
@@ -205,7 +250,12 @@ agent_turns_last_30s: {session.agent_turns_last_30s}\
 """
 
 
-class Classifier:
+# ---------------------------------------------------------------------------
+# Backend: Bedrock Haiku 4.5
+# ---------------------------------------------------------------------------
+
+
+class BedrockClassifier:
     """Bedrock Haiku 4.5 classifier with fail-closed-to-silent semantics.
 
     For each completed ``Utterance``, queries Haiku 4.5 via the Bedrock Converse
@@ -216,6 +266,10 @@ class Classifier:
     violation — is logged as a warning and the method returns a silent
     ``Decision`` so the pipeline never blocks.
     """
+
+    DEFAULT_MODEL_ID: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    DEFAULT_REGION: str = "us-west-2"
+    DEFAULT_TIMEOUT_S: float = 2.0
 
     def __init__(
         self,
@@ -305,4 +359,103 @@ class Classifier:
             raise ValueError("classifier response contained no toolUse block")
         except Exception:
             _logger.warning("Classifier failed; returning silent decision.", exc_info=True)
+            return Decision(speaker="unknown", action="silent", confidence=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Backend: local Ollama
+# ---------------------------------------------------------------------------
+
+_VALID_ACTIONS: frozenset[str] = frozenset({"silent", "hedged_answer", "full_answer"})
+
+
+class OllamaClassifier:
+    """Local Ollama classifier; mirrors BedrockClassifier's behavior via JSON-schema output.
+
+    Uses Ollama's structured-output ``format=`` parameter (requires Ollama 0.5+ or
+    ``ollama`` Python client >= 0.4.0) to constrain the model response to the
+    same speaker / action / confidence schema used by the Bedrock backend.
+
+    Any exception — connection error, timeout, parse failure, schema violation —
+    is logged as a warning and the method returns a silent ``Decision`` so the
+    pipeline never blocks.
+    """
+
+    DEFAULT_MODEL: str = "qwen3.5:35b-a3b"
+    DEFAULT_HOST: str = "http://localhost:11434"
+    DEFAULT_TIMEOUT_S: float = 10.0
+
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        host: str | None = None,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+    ) -> None:
+        """Store config; the Ollama client is lazy-created on first classify call.
+
+        Args:
+            model: Ollama model tag (e.g. ``"qwen3.5:35b-a3b"``).
+            host: Ollama daemon URL.  Falls back to the ``OLLAMA_HOST`` environment
+                variable, then ``http://localhost:11434``.
+            timeout_s: HTTP timeout in seconds for each classify call.
+        """
+        self.model = model
+        self.host = host or os.environ.get("OLLAMA_HOST") or self.DEFAULT_HOST
+        self.timeout_s = timeout_s
+        self._client: ollama.Client | None = None
+
+    def _get_client(self) -> ollama.Client:
+        """Return the Ollama client, creating it if needed."""
+        if self._client is None:
+            self._client = ollama.Client(host=self.host, timeout=self.timeout_s)
+        return self._client
+
+    def classify(
+        self,
+        utterance: Utterance,
+        confidence: Confidence,
+        context: ProjectContext,
+        session: SessionState,
+    ) -> Decision:
+        """Classify one utterance via local Ollama; fail closed to silent on any error.
+
+        Args:
+            utterance: The completed utterance from ``StreamingASR``.
+            confidence: ASR confidence features for this utterance.
+            context: Stable per-meeting project context (speaker roster, etc.).
+            session: Rolling airtime and transcript signals.
+
+        Returns:
+            A ``Decision`` with speaker attribution, action, and confidence.
+            Returns ``Decision(speaker="unknown", action="silent", confidence=0.0)``
+            on any error.
+        """
+        try:
+            system = _build_system_prompt(context)
+            user = _build_user_prompt(utterance, confidence, session)
+
+            response = self._get_client().chat(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                format=_DECISION_JSON_SCHEMA,
+                options={"temperature": 0.0, "num_predict": 256},
+            )
+            text = response["message"]["content"]
+            raw: dict[str, Any] = json.loads(text)
+            action = raw["action"]
+            if action not in _VALID_ACTIONS:
+                raise ValueError(f"Unknown action value: {action!r}")
+            return Decision(
+                speaker=str(raw["speaker"]),
+                action=action,
+                confidence=float(raw["confidence"]),
+            )
+        except Exception:
+            _logger.warning(
+                "OllamaClassifier failed; returning silent decision.",
+                exc_info=True,
+            )
             return Decision(speaker="unknown", action="silent", confidence=0.0)

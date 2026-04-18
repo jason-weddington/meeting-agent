@@ -29,6 +29,12 @@ for _mlx_mod in ("mlx", "mlx.core", "mlx.nn", "mlx.utils", "mlx.optimizers"):
     if _mlx_mod not in sys.modules:
         sys.modules[_mlx_mod] = MagicMock()
 
+# ollama requires a running Ollama daemon and the native C extension. Stub it
+# out so that meeting_agent.classifier can be imported on headless CI hosts
+# where the real package may not be installed.
+if "ollama" not in sys.modules:
+    sys.modules["ollama"] = MagicMock()
+
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Skip integration-marked tests unless ``-m integration`` is explicitly passed."""

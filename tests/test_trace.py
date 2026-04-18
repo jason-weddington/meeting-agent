@@ -90,7 +90,7 @@ def _run_traced_pipeline(
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),

@@ -29,12 +29,18 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from meeting_agent import audio
 from meeting_agent.asr import StreamingASR, Utterance
 from meeting_agent.audio import AudioArray
-from meeting_agent.classifier import Classifier, Confidence, SessionState
+from meeting_agent.classifier import (
+    BedrockClassifier,
+    Classifier,
+    Confidence,
+    OllamaClassifier,
+    SessionState,
+)
 from meeting_agent.llm import BedrockClient, Conversation, ProjectContext, Turn
 from meeting_agent.trace import Tracer
 from meeting_agent.trace import install as _install_trace
@@ -265,12 +271,39 @@ class PipelineConfig:
     input_device: int | None = None
     output_device: int | None = None
     model_id: str = "us.anthropic.claude-sonnet-4-6"
-    classifier_model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    classifier_backend: Literal["bedrock", "ollama"] = "bedrock"
+    classifier_model: str | None = None  # None → backend-specific default
+    ollama_host: str | None = None
     asr_initial_prompt: str | None = None
     context: ProjectContext = field(default_factory=lambda: ProjectContext(system_prompt=""))
     trace_enabled: bool = False
     trace_verbose: bool = False
     trace_log_dir: Path | None = None
+
+
+# ---------------------------------------------------------------------------
+# Classifier factory
+# ---------------------------------------------------------------------------
+
+
+def _build_classifier(config: PipelineConfig) -> Classifier:
+    """Construct and return the appropriate classifier backend from *config*.
+
+    Args:
+        config: Pipeline configuration specifying backend, model, and host.
+
+    Returns:
+        A :class:`BedrockClassifier` (default) or :class:`OllamaClassifier`
+        depending on ``config.classifier_backend``.
+    """
+    if config.classifier_backend == "ollama":
+        return OllamaClassifier(
+            model=config.classifier_model or OllamaClassifier.DEFAULT_MODEL,
+            host=config.ollama_host,
+        )
+    return BedrockClassifier(
+        model_id=config.classifier_model or BedrockClassifier.DEFAULT_MODEL_ID,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +334,7 @@ class Pipeline:
         asr = StreamingASR(initial_prompt=config.asr_initial_prompt)
         tts = TTS()
         llm = BedrockClient(model_id=config.model_id)
-        classifier = Classifier(model_id=config.classifier_model_id)
+        classifier: Classifier = _build_classifier(config)
 
         # Rolling transcript initialised empty.
         conversation = Conversation(older_turns=[], latest_turn=None)
