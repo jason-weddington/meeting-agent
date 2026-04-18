@@ -13,7 +13,6 @@ dependencies = [
     "mlx-audio>=0.2.10",
     "mlx-whisper>=0.4.3",
     "numpy>=2.4.4",
-    "openwakeword>=0.4.0",
     "silero-vad>=6.2.1",
     "sounddevice>=0.5.5",
     "soundfile>=0.13.1",
@@ -77,10 +76,6 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "sounddevice"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "openwakeword.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
