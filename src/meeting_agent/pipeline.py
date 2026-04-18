@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
+
 from meeting_agent import audio
 from meeting_agent.asr import StreamingASR, Utterance
 from meeting_agent.audio import AudioArray
@@ -48,7 +50,8 @@ from meeting_agent.tts import SAMPLE_RATE as TTS_SAMPLE_RATE
 from meeting_agent.tts import TTS
 
 _CHUNK_MS = 100
-_ECHO_TAIL_S = 0.5  # extra drain time past playback to flush speaker echo
+_ECHO_TAIL_S = 1.5  # extra drain time past playback to flush speaker echo + room reverb
+_SPEAKER_FLUSH_S = 0.25  # silence pad played after last TTS chunk to flush hardware output buffer
 
 # Staleness thresholds: age > DROP_S → discard entirely; age in (HEDGE_S, DROP_S]
 # and action == "full_answer" → downgrade to "hedged_answer".
@@ -509,7 +512,7 @@ class Pipeline:
                 try:
                     with circuit_breaker:
                         t_speak_start = time.monotonic()
-                        full_response = self._stream_and_play(
+                        full_response, tts_audio_s = self._stream_and_play(
                             config,
                             conversation,
                             llm,
@@ -551,8 +554,19 @@ class Pipeline:
                 # ------------------------------------------------------------------
                 # Drain echo — discard backlogged mic audio captured while
                 # the agent was speaking to prevent feedback on next utterance.
+                #
+                # drain_base = max(speak_duration, tts_audio_s):
+                #   • speak_duration covers the full mic backlog (wall-clock
+                #     time the mic was running during the response — the mic
+                #     queue has at most speak_duration*10 backlogged chunks).
+                #   • tts_audio_s is the floor: the drain must cover at least
+                #     as long as the audio that played through the speakers,
+                #     because the echo can't arrive before the audio started.
+                #     In production speak_duration ≥ tts_audio_s; the max()
+                #     makes the floor explicit and keeps unit tests honest.
                 # ------------------------------------------------------------------
-                self._drain_echo(chunks_iter, speak_duration + _ECHO_TAIL_S)
+                drain_base = max(speak_duration, tts_audio_s)
+                self._drain_echo(chunks_iter, drain_base + _ECHO_TAIL_S)
 
         except KeyboardInterrupt:
             pass
@@ -590,7 +604,7 @@ class Pipeline:
         t_asr_done: float,
         tracer: Tracer,
         utterance_text: str,
-    ) -> str:
+    ) -> tuple[str, float]:
         """Stream Claude's response, pipeline TTS on sentence boundaries.
 
         Sentence boundaries (``.``, ``?``, ``!``) flush the accumulated buffer
@@ -600,6 +614,13 @@ class Pipeline:
         The mic is implicitly gated during this method: the main loop is blocked
         inside this call, so ASR chunk consumption is suspended for the duration
         of agent speech.
+
+        After the last TTS chunk plays, a short silence pad
+        (``_SPEAKER_FLUSH_S``) is sent to the output device so that the
+        hardware output buffer fully drains before this method returns.  Without
+        this pad, PortAudio signals "stream done" while the hardware DAC still
+        has the last few milliseconds buffered, producing a clipped / scrambled
+        cutoff on the final syllable.
 
         Timing events are emitted via *tracer* when trace is enabled:
 
@@ -616,11 +637,16 @@ class Pipeline:
             utterance_text: Text of the triggering utterance (for trace records).
 
         Returns:
-            The full agent response as a single concatenated string.
+            A ``(full_response, tts_audio_s)`` tuple where *full_response* is
+            the agent response as a concatenated string and *tts_audio_s* is
+            the total duration in seconds of audio sent to the output device
+            (excluding the silence flush).  The caller uses *tts_audio_s* as
+            a floor for the echo-drain window.
         """
         sentence_q: queue.Queue[str | None] = queue.Queue()
         first_delta_t: list[float] = []
         first_audio_t: list[float] = []
+        tts_audio_s_ref: list[float] = [0.0]  # accumulated TTS audio duration
 
         def _tts_worker() -> None:
             """Consume sentences, synthesise, and play until sentinel arrives."""
@@ -629,6 +655,7 @@ class Pipeline:
                 if sentence is None:
                     return
                 for chunk in tts.stream_synthesize(sentence):
+                    tts_audio_s_ref[0] += len(chunk) / TTS_SAMPLE_RATE
                     if not first_audio_t:
                         first_audio_t.append(time.monotonic())
                     audio.play(
@@ -667,7 +694,17 @@ class Pipeline:
             sentence_q.put(None)  # sentinel — stops the worker
             worker.join()
 
-            # Emit the response_emitted trace event now that all timing is known.
+            # Flush the speaker hardware output buffer.  PortAudio fires "stream
+            # finished" when its ring-buffer is exhausted, but the hardware DAC
+            # still holds one callback-block of audio.  Playing a silence pad
+            # forces those samples out of the hardware buffer cleanly, preventing
+            # the scrambled-cutoff artefact on the final syllable.
+            silence_flush = np.zeros(int(TTS_SAMPLE_RATE * _SPEAKER_FLUSH_S), dtype=np.float32)
+            audio.play(silence_flush, sample_rate=TTS_SAMPLE_RATE, device=config.output_device)
+
+            # Emit the response_emitted trace event now that all timing is known
+            # (after the silence flush so the timestamp marks the true end of
+            # audible output).
             tracer.emit(
                 "response_emitted",
                 triggering_utterance=utterance_text,
@@ -681,7 +718,7 @@ class Pipeline:
                 total_turn_latency_s=first_audio_t[0] - t_asr_done if first_audio_t else None,
             )
 
-        return full_response
+        return full_response, tts_audio_s_ref[0]
 
 
 def _split_at_sentence_boundaries(text: str) -> tuple[list[str], str]:

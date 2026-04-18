@@ -1016,7 +1016,7 @@ def test_stream_and_play_preserves_raw_text_in_transcript():
     )
 
     with patch("meeting_agent.audio.play"):
-        raw = pipeline._stream_and_play(
+        raw, tts_s = pipeline._stream_and_play(
             PipelineConfig(),
             conversation,
             mock_llm,
@@ -1030,6 +1030,108 @@ def test_stream_and_play_preserves_raw_text_in_transcript():
     assert raw == "Here's **what** I think."
     # TTS must have received the filtered version.
     mock_tts.stream_synthesize.assert_called_once_with("Here's what I think.")
+    # tts_s is the audio duration of the mocked chunk (24000 samples / 24000 Hz = 1.0 s)
+    assert tts_s == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# mic-echo fix: silence flush + drain window tests
+# ---------------------------------------------------------------------------
+
+
+def test_stream_and_play_silence_flush_after_last_tts_chunk():
+    """_stream_and_play plays a zero-filled silence flush after all TTS chunks.
+
+    Root cause: PortAudio fires "stream finished" when its ring-buffer is
+    exhausted, but the hardware DAC still has the last callback-block of audio
+    in its output buffer.  Without a silence pad the very end of the TTS audio
+    is cut off (scrambled cutoff artefact).  The silence pad forces those
+    samples to play out cleanly.
+
+    The final call to ``audio.play()`` after ``worker.join()`` must be a
+    silence buffer (all zeros) at the TTS sample rate.
+    """
+    import logging
+
+    from meeting_agent.llm import Conversation
+    from meeting_agent.trace import Tracer
+
+    mock_llm = MagicMock()
+    mock_llm.respond_stream.return_value = iter(["Hello world."])
+
+    tts_chunk = np.ones(24_000, dtype=np.float32) * 0.5  # non-zero audio
+    mock_tts = MagicMock()
+    mock_tts.stream_synthesize.return_value = iter([tts_chunk])
+
+    pipeline = Pipeline(PipelineConfig())
+    conversation = Conversation()
+    conversation.latest_turn = Turn(speaker="Jason", text="Hi")
+    noop_tracer = Tracer(
+        enabled=False, verbose=False, logger=logging.getLogger("meeting_agent.trace")
+    )
+
+    play_calls: list[np.ndarray] = []
+
+    def capture_play(audio_arr: np.ndarray, **_kwargs: object) -> None:  # type: ignore[override]
+        play_calls.append(audio_arr.copy())
+
+    with patch("meeting_agent.audio.play", side_effect=capture_play):
+        pipeline._stream_and_play(
+            PipelineConfig(),
+            conversation,
+            mock_llm,
+            mock_tts,
+            0.0,
+            noop_tracer,
+            "Hi",
+        )
+
+    assert len(play_calls) >= 2, "Expected at least one TTS chunk + one silence flush"
+    # The LAST play() call must be an all-zeros silence flush
+    last = play_calls[-1]
+    assert np.all(last == 0.0), "Last play() call should be the silence flush (all zeros)"
+    # Silence flush must be non-empty (covers _SPEAKER_FLUSH_S > 0)
+    assert len(last) > 0, "Silence flush must not be empty"
+
+
+def test_drain_duration_covers_tts_audio_duration():
+    """Echo drain window is at least as long as the TTS audio that played.
+
+    Root cause: if the drain window is shorter than the TTS audio duration,
+    the mic queue still contains echo from the end of the agent's speech when
+    ASR resumes — producing a spurious utterance with the tail of the response.
+
+    The drain call uses ``max(speak_duration, tts_audio_s) + _ECHO_TAIL_S``.
+    In production speak_duration ≥ tts_audio_s; in the mocked test environment
+    speak_duration ≈ 0, so tts_audio_s becomes the binding floor.
+    Either way, drain_duration ≥ tts_audio_s must hold.
+    """
+    # 2 seconds of TTS audio at 24 kHz
+    tts_audio_2s = np.zeros(int(24_000 * 2), dtype=np.float32)
+    utterance = _make_utterance("What is the plan?")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_full_answer_decision()],
+        lm_deltas=["Here is the plan."],
+        tts_audio=tts_audio_2s,
+    )
+
+    drain_durations: list[float] = []
+    original_drain = Pipeline._drain_echo
+
+    def capture_drain(self: Pipeline, chunks_iter: object, duration_s: float) -> None:
+        drain_durations.append(duration_s)
+        original_drain(self, chunks_iter, duration_s)  # type: ignore[arg-type]
+
+    with patch.object(Pipeline, "_drain_echo", capture_drain):
+        _run_v2_pipeline(mock_asr, mock_classifier, mock_llm, mock_tts)
+
+    assert drain_durations, "_drain_echo should have been called for the response"
+    tts_audio_s = 2.0  # 24000 * 2 / 24000
+    assert drain_durations[0] >= tts_audio_s, (
+        f"Drain duration {drain_durations[0]:.3f}s is shorter than TTS audio "
+        f"duration {tts_audio_s:.3f}s — echo tail will not be fully consumed"
+    )
 
 
 # ---------------------------------------------------------------------------
