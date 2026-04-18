@@ -310,3 +310,36 @@ def test_confidence_features_in_prompt():
     assert "-0.500" in user_text
     assert "0.200" in user_text
     assert "1.800" in user_text
+
+
+# ---------------------------------------------------------------------------
+# Cache telemetry tests
+# ---------------------------------------------------------------------------
+
+
+def test_classifier_logs_cache_usage(caplog):
+    """classify() logs a classifier_usage record with cache token fields."""
+    mock_client = MagicMock()
+    response = _make_classify_response("Alice", "full_answer", 0.9)
+    response["usage"] = {
+        "inputTokens": 1234,
+        "outputTokens": 56,
+        "totalTokens": 1290,
+        "cacheReadInputTokens": 1200,
+        "cacheWriteInputTokens": 0,
+    }
+    mock_client.converse.return_value = response
+    with patch("boto3.client", return_value=mock_client):
+        classifier = Classifier()
+        with caplog.at_level(logging.INFO, logger="meeting_agent.classifier"):
+            classifier.classify(
+                _make_utterance(), _make_confidence(), _make_context(), _make_session()
+            )
+
+    usage_records = [r for r in caplog.records if r.getMessage() == "classifier_usage"]
+    assert len(usage_records) == 1, f"Expected 1 classifier_usage record, got {len(usage_records)}"
+    rec = usage_records[0]
+    assert rec.input_tokens == 1234
+    assert rec.output_tokens == 56
+    assert rec.cache_read_tokens == 1200
+    assert rec.cache_write_tokens == 0

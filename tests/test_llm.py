@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -353,3 +354,78 @@ def test_client_reused_across_calls():
 
     # boto3.client should only be called once (lazy init)
     mock_boto3_client.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Cache telemetry tests
+# ---------------------------------------------------------------------------
+
+
+def test_respond_stream_logs_cache_usage_on_metadata_event(caplog):
+    """A metadata event in the stream fires a response_llm_usage log record."""
+    metadata_event = {
+        "metadata": {
+            "usage": {
+                "inputTokens": 500,
+                "outputTokens": 30,
+                "totalTokens": 530,
+                "cacheReadInputTokens": 480,
+                "cacheWriteInputTokens": 0,
+            }
+        }
+    }
+    stream = _make_stream("hello", extra_events=[metadata_event])
+    mock_client = _make_client_mock(stream)
+    with patch("boto3.client", return_value=mock_client):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        with caplog.at_level(logging.INFO, logger="meeting_agent.llm"):
+            result = list(client.respond_stream(context, conversation))
+
+    assert result == ["hello"]
+    usage_records = [r for r in caplog.records if r.getMessage() == "response_llm_usage"]
+    assert len(usage_records) == 1, (
+        f"Expected 1 response_llm_usage record, got {len(usage_records)}"
+    )
+    rec = usage_records[0]
+    assert rec.input_tokens == 500
+    assert rec.output_tokens == 30
+    assert rec.cache_read_tokens == 480
+    assert rec.cache_write_tokens == 0
+
+
+def test_respond_stream_handles_missing_metadata_event(caplog):
+    """Stream without a metadata event produces no usage log and no crash."""
+    stream = _make_stream("hello", " world")
+    mock_client = _make_client_mock(stream)
+    with patch("boto3.client", return_value=mock_client):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        with caplog.at_level(logging.INFO, logger="meeting_agent.llm"):
+            result = list(client.respond_stream(context, conversation))
+
+    assert result == ["hello", " world"]
+    usage_records = [r for r in caplog.records if r.getMessage() == "response_llm_usage"]
+    assert len(usage_records) == 0
+
+
+def test_respond_stream_cache_hit_skipped_when_zero_input_tokens(caplog):
+    """metadata event with no inputTokens suppresses cache-hit summary log."""
+    metadata_event = {"metadata": {"usage": {"inputTokens": 0, "outputTokens": 0}}}
+    stream = _make_stream("hi", extra_events=[metadata_event])
+    mock_client = _make_client_mock(stream)
+    with patch("boto3.client", return_value=mock_client):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        with caplog.at_level(logging.INFO, logger="meeting_agent.llm"):
+            result = list(client.respond_stream(context, conversation))
+
+    assert result == ["hi"]
+    # usage event still logged; no cache-hit summary (hit_rate skipped when total=0)
+    usage_records = [r for r in caplog.records if r.getMessage() == "response_llm_usage"]
+    assert len(usage_records) == 1
+    cache_records = [r for r in caplog.records if "cache:" in (r.getMessage() or "")]
+    assert len(cache_records) == 0

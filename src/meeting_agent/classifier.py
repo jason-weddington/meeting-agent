@@ -29,6 +29,23 @@ Action = Literal["silent", "hedged_answer", "full_answer"]
 _logger = logging.getLogger(__name__)
 
 
+def _log_cache_hit(logger: logging.Logger, call: str, usage: dict[str, Any]) -> None:
+    """Log a human-readable cache-hit summary when total input tokens > 0."""
+    read = usage.get("cacheReadInputTokens", 0)
+    write = usage.get("cacheWriteInputTokens", 0)
+    total_input = usage.get("inputTokens", 0)
+    if total_input == 0:
+        return
+    hit_rate = read / total_input
+    logger.info(
+        "%s cache: read=%d write=%d hit_rate=%.0f%%",
+        call,
+        read,
+        write,
+        hit_rate * 100,
+    )
+
+
 @dataclass(frozen=True)
 class Confidence:
     """ASR-level confidence features surfaced to the classifier."""
@@ -265,14 +282,26 @@ class Classifier:
                 toolConfig=_TOOL_CONFIG,  # type: ignore[arg-type]
             )
             content: list[dict[str, Any]] = response["output"]["message"]["content"]  # type: ignore[assignment]
+            usage: dict[str, Any] = response.get("usage", {})  # type: ignore[assignment]
             for block in content:
                 if "toolUse" in block:
                     raw: dict[str, Any] = block["toolUse"]["input"]
-                    return Decision(
+                    decision = Decision(
                         speaker=str(raw["speaker"]),
                         action=raw["action"],
                         confidence=float(raw["confidence"]),
                     )
+                    _logger.info(
+                        "classifier_usage",
+                        extra={
+                            "input_tokens": usage.get("inputTokens", 0),
+                            "output_tokens": usage.get("outputTokens", 0),
+                            "cache_read_tokens": usage.get("cacheReadInputTokens", 0),
+                            "cache_write_tokens": usage.get("cacheWriteInputTokens", 0),
+                        },
+                    )
+                    _log_cache_hit(_logger, "classifier", usage)
+                    return decision
             raise ValueError("classifier response contained no toolUse block")
         except Exception:
             _logger.warning("Classifier failed; returning silent decision.", exc_info=True)

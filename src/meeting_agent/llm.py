@@ -7,6 +7,7 @@ the network boundary — never audio.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -15,6 +16,26 @@ import boto3
 
 if TYPE_CHECKING:
     from mypy_boto3_bedrock_runtime import BedrockRuntimeClient
+
+_logger = logging.getLogger(__name__)
+
+
+def _log_cache_hit(logger: logging.Logger, call: str, usage: dict[str, Any]) -> None:
+    """Log a human-readable cache-hit summary when total input tokens > 0."""
+    read = usage.get("cacheReadInputTokens", 0)
+    write = usage.get("cacheWriteInputTokens", 0)
+    total_input = usage.get("inputTokens", 0)
+    if total_input == 0:
+        return
+    hit_rate = read / total_input
+    logger.info(
+        "%s cache: read=%d write=%d hit_rate=%.0f%%",
+        call,
+        read,
+        write,
+        hit_rate * 100,
+    )
+
 
 DEFAULT_MODEL_ID: str = "us.anthropic.claude-sonnet-4-6"
 DEFAULT_REGION: str = "us-west-2"
@@ -192,3 +213,15 @@ class BedrockClient:
                 delta = event["contentBlockDelta"]["delta"]
                 if "text" in delta:
                     yield delta["text"]
+            elif "metadata" in event:
+                usage: dict[str, Any] = event["metadata"].get("usage", {})  # type: ignore[assignment]
+                _logger.info(
+                    "response_llm_usage",
+                    extra={
+                        "input_tokens": usage.get("inputTokens", 0),
+                        "output_tokens": usage.get("outputTokens", 0),
+                        "cache_read_tokens": usage.get("cacheReadInputTokens", 0),
+                        "cache_write_tokens": usage.get("cacheWriteInputTokens", 0),
+                    },
+                )
+                _log_cache_hit(_logger, "response_llm", usage)
