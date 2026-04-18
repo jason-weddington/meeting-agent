@@ -494,12 +494,14 @@ class Pipeline:
                 # Flush completed sentences into the TTS worker queue.
                 complete, buffer = _split_at_sentence_boundaries(buffer)
                 for sentence in complete:
-                    if sentence.strip():
-                        sentence_q.put(sentence)
+                    cleaned = _strip_tts_markdown(sentence)
+                    if cleaned.strip():
+                        sentence_q.put(cleaned)
         finally:
             # Flush any remaining (unpunctuated) tail as the final sentence.
-            if buffer.strip():
-                sentence_q.put(buffer)
+            tail_cleaned = _strip_tts_markdown(buffer)
+            if tail_cleaned.strip():
+                sentence_q.put(tail_cleaned)
             sentence_q.put(None)  # sentinel — stops the worker
             worker.join()
 
@@ -539,3 +541,44 @@ def _split_at_sentence_boundaries(text: str) -> tuple[list[str], str]:
         i += 2
     remainder = parts[i] if i < len(parts) else ""
     return sentences, remainder
+
+
+def _strip_tts_markdown(text: str) -> str:
+    r"""Strip markdown / TTS-hostile symbols from text before synthesis.
+
+    Replaces bold/italic/code wrappers with their inner text. Drops line-prefix
+    markers (bullets, numbered lists, headings). Removes fenced code blocks
+    entirely (they're not something the agent should be speaking).
+
+    Idempotent — running it twice produces the same output.
+
+    The raw LLM response is *not* affected by this function; it is only applied
+    at the TTS boundary so the conversation transcript retains the original text.
+
+    Args:
+        text: Text from the LLM response, potentially containing markdown.
+
+    Returns:
+        Text with markdown symbols stripped, suitable for TTS synthesis.
+
+    Examples:
+        >>> _strip_tts_markdown("This is **bold** and *italic*")
+        'This is bold and italic'
+        >>> _strip_tts_markdown("- first\n- second\n- third")
+        'first\nsecond\nthird'
+        >>> _strip_tts_markdown("## Heading\n\ntext")
+        'Heading\n\ntext'
+    """
+    # Remove fenced code blocks entirely (they'd be read literally).
+    text = re.sub(r"```[^`]*```", "", text, flags=re.DOTALL)
+    # Unwrap **bold**, __bold__, *italic*, _italic_, `code`.
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"__(.+?)__", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"\*(.+?)\*", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"_(.+?)_", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    # Strip line-prefix markers: bullets, numbered lists, headings.
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*#{1,6}\s+", "", text, flags=re.MULTILINE)
+    return text

@@ -23,6 +23,7 @@ from meeting_agent.pipeline import (
     _install_exception_log,
     _is_low_confidence,
     _split_at_sentence_boundaries,
+    _strip_tts_markdown,
 )
 
 # ---------------------------------------------------------------------------
@@ -846,3 +847,101 @@ def test_unpunctuated_lm_response_still_synthesised():
     _run_v2_pipeline(mock_asr, mock_classifier, mock_llm, mock_tts)
 
     mock_tts.stream_synthesize.assert_called_once_with("Sure thing")
+
+
+# ---------------------------------------------------------------------------
+# _strip_tts_markdown unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_strip_tts_markdown_bold_italic():
+    """Bold and italic markers are replaced with the wrapped text."""
+    assert _strip_tts_markdown("This is **bold** and *italic*") == "This is bold and italic"
+
+
+def test_strip_tts_markdown_bullets():
+    """Bullet list prefixes are stripped, leaving only the item text."""
+    assert _strip_tts_markdown("- first\n- second") == "first\nsecond"
+
+
+def test_strip_tts_markdown_numbered_list():
+    """Numbered list prefixes are stripped, leaving only the item text."""
+    assert _strip_tts_markdown("1. first\n2. second") == "first\nsecond"
+
+
+def test_strip_tts_markdown_headings():
+    """Heading prefixes (# through ######) are stripped."""
+    assert _strip_tts_markdown("# H1\n## H2\ntext") == "H1\nH2\ntext"
+
+
+def test_strip_tts_markdown_inline_code():
+    """Inline code backticks are removed, leaving the code text."""
+    assert _strip_tts_markdown("use `foo()` here") == "use foo() here"
+
+
+def test_strip_tts_markdown_fenced_code_removed():
+    """Fenced code blocks are removed entirely."""
+    result = _strip_tts_markdown("before\n```\ncode\n```\nafter")
+    assert result == "before\n\nafter"
+
+
+def test_strip_tts_markdown_idempotent():
+    """Running the filter twice produces the same result as running it once."""
+    text = "This is **bold** and *italic*\n- bullet\n## Heading"
+    once = _strip_tts_markdown(text)
+    twice = _strip_tts_markdown(once)
+    assert once == twice
+
+
+def test_strip_tts_markdown_preserves_plain_prose():
+    """Plain prose without any markdown is returned unchanged."""
+    text = "Just a normal sentence."
+    assert _strip_tts_markdown(text) == text
+
+
+def test_strip_tts_markdown_preserves_punctuation_in_clarifier():
+    """Apostrophes, question marks, and quoted phrases are preserved."""
+    text = "When you say 'skill', do you mean Y?"
+    assert _strip_tts_markdown(text) == text
+
+
+def test_stream_and_play_applies_filter_before_tts():
+    """TTS receives the filtered (markdown-stripped) text, not the raw LLM output."""
+    utterance = _make_utterance("Question")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_full_answer_decision(speaker="Jason")],
+        lm_deltas=["Here's **what** I think."],
+    )
+    _run_v2_pipeline(mock_asr, mock_classifier, mock_llm, mock_tts)
+
+    mock_tts.stream_synthesize.assert_called_once_with("Here's what I think.")
+
+
+def test_stream_and_play_preserves_raw_text_in_transcript():
+    """_stream_and_play returns the raw (unfiltered) LLM text for the transcript.
+
+    The pipeline stores the return value of _stream_and_play verbatim in
+    conversation.older_turns.  Confirming the return value is raw ensures that
+    the transcript records what the LLM actually generated, not the TTS-cleaned
+    version.
+    """
+    from meeting_agent.llm import Conversation
+
+    mock_llm = MagicMock()
+    mock_llm.respond_stream.return_value = iter(["Here's **what** I think."])
+
+    mock_tts = MagicMock()
+    mock_tts.stream_synthesize.return_value = iter([_FAKE_AUDIO_CHUNK])
+
+    pipeline = Pipeline(PipelineConfig())
+    conversation = Conversation()
+    conversation.latest_turn = Turn(speaker="Jason", text="Question")
+
+    with patch("meeting_agent.audio.play"):
+        raw = pipeline._stream_and_play(PipelineConfig(), conversation, mock_llm, mock_tts, 0.0)
+
+    # Return value must be the unfiltered LLM output.
+    assert raw == "Here's **what** I think."
+    # TTS must have received the filtered version.
+    mock_tts.stream_synthesize.assert_called_once_with("Here's what I think.")
