@@ -381,12 +381,14 @@ class OllamaClassifier:
     pipeline never blocks.
     """
 
-    DEFAULT_MODEL: str = "qwen3.5:35b-a3b"
+    DEFAULT_MODEL: str = "qwen3.6:35b-a3b-mlx-bf16"
     DEFAULT_HOST: str = "http://localhost:11434"
-    # 60s accommodates cold-load of large MoE models (qwen3.5:35b-a3b) into
-    # Ollama. Warm-call latency is hundreds of ms; timeout only matters the
-    # very first call before the daemon has the weights resident.
-    DEFAULT_TIMEOUT_S: float = 60.0
+    # 300s accommodates cold-load of large MoE models. qwen3.6-mlx-bf16 is
+    # ~70 GB on disk and takes ~20 s to page in; the bf16 build runs ~2x
+    # faster than qwen3.5 at steady state on Apple Silicon. Warm-call
+    # latency is hundreds of ms; the timeout only matters for the very
+    # first call before the daemon has the weights resident.
+    DEFAULT_TIMEOUT_S: float = 300.0
 
     def __init__(
         self,
@@ -397,7 +399,7 @@ class OllamaClassifier:
         """Store config; the Ollama client is lazy-created on first classify call.
 
         Args:
-            model: Ollama model tag (e.g. ``"qwen3.5:35b-a3b"``).
+            model: Ollama model tag (e.g. ``"qwen3.6:35b-a3b-mlx-bf16"``).
             host: Ollama daemon URL.  Falls back to the ``OLLAMA_HOST`` environment
                 variable, then ``http://localhost:11434``.
             timeout_s: HTTP timeout in seconds for each classify call.
@@ -416,7 +418,7 @@ class OllamaClassifier:
     def warm_up(self) -> bool:
         """Force-load the model into Ollama's memory with a minimal request.
 
-        Large MoE models (qwen3.5:35b-a3b) take 10–30 s to cold-load. Without
+        Large MoE models (qwen3.6-mlx-bf16 is ~70 GB) take 10–30 s to cold-load. Without
         a warm-up, the first real utterance either times out or gets dropped
         by the pipeline's staleness gate. Call this once at pipeline startup
         so the first user turn hits a resident model.

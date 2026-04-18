@@ -140,7 +140,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Classifier model name. "
             "bedrock default: us.anthropic.claude-haiku-4-5-20251001-v1:0  "
-            "ollama default: qwen3.5:35b-a3b"
+            "ollama default: qwen3.6:35b-a3b-mlx-bf16"
         ),
     )
     parser.add_argument(

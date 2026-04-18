@@ -40,15 +40,15 @@ uv run python scripts/latency_check.py asr  # ASR latency smoke test (needs mic)
 `meeting-agent` supports two classifier backends:
 
 - **Bedrock Haiku** (default) — `--classifier-backend bedrock`
-- **Local Ollama** — `--classifier-backend ollama --classifier-model qwen3.5:35b-a3b`
+- **Local Ollama** — `--classifier-backend ollama` (defaults to `qwen3.6:35b-a3b-mlx-bf16`)
 
 The Ollama backend hits a running `ollama serve` daemon. Use `--ollama-host` or
 the `OLLAMA_HOST` env var to override the default `http://localhost:11434`.
 
 Model is configurable per-run; code is unchanged:
 ```bash
-uv run meeting-agent --classifier-backend ollama --classifier-model qwen3.5:35b-a3b
-uv run meeting-agent --classifier-backend ollama --classifier-model qwen3.6:35b-a3b-mlx-bf16
+uv run meeting-agent --classifier-backend ollama                                            # qwen3.6 default
+uv run meeting-agent --classifier-backend ollama --classifier-model qwen3.5:35b-a3b        # fallback
 ```
 
 ## Module layout
