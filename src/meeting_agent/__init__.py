@@ -4,6 +4,7 @@ __all__ = [
     "asr",
     "audio",
     "cli",
+    "context",
     "llm",
     "pipeline",
     "tts",

@@ -148,16 +148,85 @@ def test_system_prompt_file_reads_file_contents(tmp_path):
     assert config.context.system_prompt == "You are a terse assistant."
 
 
-def test_project_docs_reads_file_into_project_context(tmp_path):
-    """--project-docs reads text and populates context.project_docs."""
-    docs_file = tmp_path / "docs.txt"
-    docs_file.write_text("Project: Acme\nGoal: maximize synergy")
+# ---------------------------------------------------------------------------
+# --context-dir / --context-uri
+# ---------------------------------------------------------------------------
 
-    argv = ["meeting-agent", "--project-docs", str(docs_file)]
+
+def test_context_dir_populates_system_prompt(tmp_path):
+    """--context-dir with .md files sets context.system_prompt to loaded content."""
+    (tmp_path / "001-role.md").write_text("You are a terse meeting bot.")
+    (tmp_path / "002-rules.md").write_text("No bullet lists.")
+
+    argv = ["meeting-agent", "--context-dir", str(tmp_path)]
     mock_cls = _run_main_with_pipeline(argv)
     config = mock_cls.call_args[0][0]
 
-    assert "Acme" in config.context.project_docs
+    assert "001-role" in config.context.system_prompt
+    assert "You are a terse meeting bot." in config.context.system_prompt
+    assert "002-rules" in config.context.system_prompt
+    assert "No bullet lists." in config.context.system_prompt
+
+
+def test_context_uri_populates_system_prompt():
+    """--context-uri calls load_context and sets context.system_prompt."""
+    with patch("meeting_agent.cli.load_context", return_value="S3 context loaded") as mock_lc:
+        mock_cls = _run_main_with_pipeline(
+            ["meeting-agent", "--context-uri", "s3://bucket/prefix/"]
+        )
+    config = mock_cls.call_args[0][0]
+    mock_lc.assert_called_once_with("s3://bucket/prefix/")
+    assert config.context.system_prompt == "S3 context loaded"
+
+
+def test_context_dir_and_system_prompt_mutually_exclusive(monkeypatch, tmp_path):
+    """--context-dir and --system-prompt together raise SystemExit(2)."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["meeting-agent", "--context-dir", str(tmp_path), "--system-prompt", "Be terse."],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 2
+
+
+def test_context_dir_and_system_prompt_file_mutually_exclusive(monkeypatch, tmp_path):
+    """--context-dir and --system-prompt-file together raise SystemExit(2)."""
+    prompt_file = tmp_path / "system.txt"
+    prompt_file.write_text("A prompt.")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["meeting-agent", "--context-dir", str(tmp_path), "--system-prompt-file", str(prompt_file)],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 2
+
+
+def test_context_uri_and_system_prompt_mutually_exclusive(monkeypatch):
+    """--context-uri and --system-prompt together raise SystemExit(2)."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["meeting-agent", "--context-uri", "s3://b/p/", "--system-prompt", "Be terse."],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 2
+
+
+def test_context_dir_and_context_uri_mutually_exclusive(monkeypatch, tmp_path):
+    """--context-dir and --context-uri together raise SystemExit(2)."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["meeting-agent", "--context-dir", str(tmp_path), "--context-uri", "s3://b/p/"],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 2
 
 
 # ---------------------------------------------------------------------------

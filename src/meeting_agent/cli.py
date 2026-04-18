@@ -6,6 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from meeting_agent.context import load_context
 from meeting_agent.llm import ProjectContext
 from meeting_agent.pipeline import Pipeline, PipelineConfig
 
@@ -86,27 +87,32 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Read custom-vocab prompt from a file (default: none)",
     )
 
-    system_prompt_group = parser.add_mutually_exclusive_group()
-    system_prompt_group.add_argument(
+    context_source_group = parser.add_mutually_exclusive_group()
+    context_source_group.add_argument(
         "--system-prompt",
         default=None,
         metavar="TEXT",
         help="System prompt for Claude (default: built-in default)",
     )
-    system_prompt_group.add_argument(
+    context_source_group.add_argument(
         "--system-prompt-file",
         default=None,
         metavar="PATH",
         type=Path,
         help="Read system prompt from a file",
     )
-
-    parser.add_argument(
-        "--project-docs",
+    context_source_group.add_argument(
+        "--context-dir",
         default=None,
         metavar="PATH",
         type=Path,
-        help="Read project docs / decision log / stakeholders (default: none)",
+        help="Local directory of *.md context files (sorted and concatenated into system prompt)",
+    )
+    context_source_group.add_argument(
+        "--context-uri",
+        default=None,
+        metavar="URI",
+        help="s3://bucket/prefix/ of *.md context files (sorted + concatenated into system prompt)",
     )
 
     return parser
@@ -133,23 +139,19 @@ def main() -> None:
     if args.initial_prompt_file is not None:
         initial_prompt = args.initial_prompt_file.read_text()
 
-    # Resolve system prompt
-    if args.system_prompt is not None:
-        system_prompt: str = args.system_prompt
+    # Resolve system prompt (one source wins; all four flags are mutually exclusive)
+    if args.context_dir is not None:
+        system_prompt: str = load_context(args.context_dir)
+    elif args.context_uri is not None:
+        system_prompt = load_context(args.context_uri)
+    elif args.system_prompt is not None:
+        system_prompt = args.system_prompt
     elif args.system_prompt_file is not None:
         system_prompt = args.system_prompt_file.read_text()
     else:
         system_prompt = DEFAULT_SYSTEM_PROMPT
 
-    # Resolve project docs
-    project_docs: str = ""
-    if args.project_docs is not None:
-        project_docs = args.project_docs.read_text()
-
-    context = ProjectContext(
-        system_prompt=system_prompt,
-        project_docs=project_docs,
-    )
+    context = ProjectContext(system_prompt=system_prompt)
 
     config = PipelineConfig(
         input_device=args.input_device,
