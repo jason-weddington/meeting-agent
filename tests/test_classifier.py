@@ -556,3 +556,41 @@ def test_ollama_fail_closed_on_unknown_action_value(caplog):
 
     assert decision == _SILENT_DECISION
     assert caplog.records, "Expected at least one warning log entry"
+
+
+# ---------------------------------------------------------------------------
+# OllamaClassifier: warm_up tests
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_warm_up_sends_minimal_chat():
+    """warm_up() sends a minimal chat request to force-load the model."""
+    mock_client = MagicMock()
+    mock_client.chat.return_value = {"message": {"content": "ok"}}
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier(model="qwen3.5:35b-a3b")
+        ok = classifier.warm_up()
+
+    assert ok is True
+    call_kwargs = mock_client.chat.call_args[1]
+    assert call_kwargs["model"] == "qwen3.5:35b-a3b"
+    assert call_kwargs["options"]["num_predict"] == 1
+    assert call_kwargs["options"]["temperature"] == 0.0
+
+
+def test_ollama_warm_up_returns_false_on_failure(caplog):
+    """warm_up() returns False and logs a warning on connection failure."""
+    mock_client = MagicMock()
+    mock_client.chat.side_effect = OSError("Connection refused")
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier()
+        with caplog.at_level(logging.WARNING, logger="meeting_agent.classifier"):
+            ok = classifier.warm_up()
+
+    assert ok is False
+    assert caplog.records, "Expected at least one warning log entry"
+
+
+def test_ollama_default_timeout_accommodates_cold_load():
+    """DEFAULT_TIMEOUT_S is at least 30s so large-model cold-load doesn't abort."""
+    assert OllamaClassifier.DEFAULT_TIMEOUT_S >= 30.0

@@ -351,6 +351,20 @@ class Pipeline:
             log_dir=config.trace_log_dir,
         )
 
+        # Ollama cold-load can take 10-30s for large MoE models; pre-warm so
+        # the first real utterance doesn't time out or get dropped by the
+        # 5s staleness gate downstream.
+        if isinstance(classifier, OllamaClassifier):
+            warm_start = time.monotonic()
+            ok = classifier.warm_up()
+            tracer.emit(
+                "ollama_warmup",
+                model=classifier.model,
+                host=classifier.host,
+                duration_s=round(time.monotonic() - warm_start, 3),
+                ok=ok,
+            )
+
         # Circuit breaker with trace callbacks.
         circuit_breaker = CircuitBreaker(
             on_circuit_open=lambda count: tracer.emit(

@@ -1084,3 +1084,64 @@ def test_classifier_factory_ollama_default_model():
     classifier = _build_classifier(config)
     assert isinstance(classifier, OllamaClassifier)
     assert classifier.model == OllamaClassifier.DEFAULT_MODEL
+
+
+def test_pipeline_warms_up_ollama_classifier_on_run():
+    """Pipeline.run() calls warm_up() on an OllamaClassifier backend before the first utterance."""
+    # A real OllamaClassifier instance so isinstance(classifier, OllamaClassifier) passes;
+    # ollama.Client is patched so warm_up's chat call hits the mock.
+    mock_ollama_client = MagicMock()
+    mock_ollama_client.chat.return_value = {"message": {"content": "ok"}}
+
+    utterance = _make_utterance("Hello agent")
+    mock_asr, _, mock_llm, mock_tts = _make_v2_mocks(utterances=[utterance])
+
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_ollama_client):
+        classifier = OllamaClassifier()
+        # Replace classify so the pipeline's per-utterance call doesn't hit the mock
+        # and muddy the warm_up call-count assertion.
+        classifier.classify = MagicMock(return_value=_full_answer_decision(speaker="Jason"))
+
+        with (
+            patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+            patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+            patch("meeting_agent.pipeline._build_classifier", return_value=classifier),
+            patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+            patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+            patch("meeting_agent.audio.play"),
+            patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
+        ):
+            Pipeline(PipelineConfig(classifier_backend="ollama")).run()
+
+    # warm_up() uses a minimal 1-token request; exactly one such call expected.
+    warmup_calls = [
+        c for c in mock_ollama_client.chat.call_args_list if c[1]["options"]["num_predict"] == 1
+    ]
+    assert len(warmup_calls) == 1, "warm_up() should issue exactly one minimal chat call"
+
+
+def test_pipeline_skips_warm_up_for_bedrock_classifier():
+    """Pipeline.run() does not call warm_up on a Bedrock classifier (no-op path)."""
+    utterance = _make_utterance("Hello agent")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_full_answer_decision(speaker="Jason")],
+    )
+    # Spec'd as BedrockClassifier so isinstance(classifier, OllamaClassifier) is False.
+    bedrock_mock = MagicMock(spec=BedrockClassifier)
+    bedrock_mock.classify.side_effect = mock_classifier.classify.side_effect
+
+    with (
+        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline._build_classifier", return_value=bedrock_mock),
+        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+        patch("meeting_agent.audio.play"),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
+    ):
+        Pipeline(PipelineConfig()).run()
+
+    # BedrockClassifier has no warm_up attribute → MagicMock(spec=...) would also
+    # not expose one. Assert that no warm_up was attempted.
+    assert not hasattr(bedrock_mock, "warm_up") or not bedrock_mock.warm_up.called

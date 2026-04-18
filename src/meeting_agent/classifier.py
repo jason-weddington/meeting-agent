@@ -383,7 +383,10 @@ class OllamaClassifier:
 
     DEFAULT_MODEL: str = "qwen3.5:35b-a3b"
     DEFAULT_HOST: str = "http://localhost:11434"
-    DEFAULT_TIMEOUT_S: float = 10.0
+    # 60s accommodates cold-load of large MoE models (qwen3.5:35b-a3b) into
+    # Ollama. Warm-call latency is hundreds of ms; timeout only matters the
+    # very first call before the daemon has the weights resident.
+    DEFAULT_TIMEOUT_S: float = 60.0
 
     def __init__(
         self,
@@ -409,6 +412,33 @@ class OllamaClassifier:
         if self._client is None:
             self._client = ollama.Client(host=self.host, timeout=self.timeout_s)
         return self._client
+
+    def warm_up(self) -> bool:
+        """Force-load the model into Ollama's memory with a minimal request.
+
+        Large MoE models (qwen3.5:35b-a3b) take 10–30 s to cold-load. Without
+        a warm-up, the first real utterance either times out or gets dropped
+        by the pipeline's staleness gate. Call this once at pipeline startup
+        so the first user turn hits a resident model.
+
+        Returns:
+            True on success, False if the warm-up request failed. Failures
+            are logged but never raise — the pipeline continues and the real
+            classify calls will fail-closed to silent.
+        """
+        try:
+            self._get_client().chat(
+                model=self.model,
+                messages=[{"role": "user", "content": "ok"}],
+                options={"temperature": 0.0, "num_predict": 1},
+            )
+            return True
+        except Exception:
+            _logger.warning(
+                "OllamaClassifier.warm_up failed; model may cold-load on first real call.",
+                exc_info=True,
+            )
+            return False
 
     def classify(
         self,
