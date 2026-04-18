@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -108,6 +109,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="s3://bucket/prefix/ of *.md context files (sorted + concatenated into system prompt)",
     )
 
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable dev-mode trace log at ~/.meeting-agent/trace.jsonl "
+            "(also enabled by MEETING_AGENT_TRACE=1)"
+        ),
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Tee one-line human summaries to stderr per event (implies --trace)",
+    )
+
     return parser
 
 
@@ -146,12 +163,18 @@ def main() -> None:
 
     context = ProjectContext(system_prompt=system_prompt)
 
+    # --trace is implied by --verbose; also accept MEETING_AGENT_TRACE env var.
+    trace_enabled: bool = args.trace or args.verbose or os.environ.get("MEETING_AGENT_TRACE") == "1"
+    trace_verbose: bool = args.verbose
+
     config = PipelineConfig(
         input_device=args.input_device,
         output_device=args.output_device,
         model_id=args.model_id,
         asr_initial_prompt=initial_prompt,
         context=context,
+        trace_enabled=trace_enabled,
+        trace_verbose=trace_verbose,
     )
 
     try:

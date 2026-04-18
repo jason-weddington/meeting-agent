@@ -329,6 +329,76 @@ def test_circuit_breaker_half_open_probe():
         pass  # succeeds — circuit closes again
 
 
+def test_circuit_breaker_open_callback_fires():
+    """on_circuit_open callback is invoked with the failure count when circuit opens."""
+    opened: list[int] = []
+    cb = CircuitBreaker(
+        fail_threshold=2,
+        fail_window_s=10.0,
+        open_s=15.0,
+        on_circuit_open=opened.append,
+    )
+
+    for _ in range(2):
+        try:
+            with cb:
+                raise RuntimeError("fail")
+        except RuntimeError:
+            pass
+
+    assert opened == [2]
+
+
+def test_circuit_breaker_half_open_callback_fires():
+    """on_circuit_half_open callback is invoked when the circuit transitions to half-open."""
+    half_opens: list[str] = []
+    cb = CircuitBreaker(
+        fail_threshold=2,
+        fail_window_s=10.0,
+        open_s=0.05,
+        on_circuit_half_open=lambda: half_opens.append("half_open"),
+    )
+
+    for _ in range(2):
+        try:
+            with cb:
+                raise RuntimeError("fail")
+        except RuntimeError:
+            pass
+
+    time.sleep(0.1)  # let open_s expire
+
+    with cb:
+        pass  # probe succeeds
+
+    assert half_opens == ["half_open"]
+
+
+def test_circuit_breaker_close_callback_fires():
+    """on_circuit_close callback is invoked when a half-open probe succeeds."""
+    closed: list[bool] = []
+    cb = CircuitBreaker(
+        fail_threshold=2,
+        fail_window_s=10.0,
+        open_s=0.05,
+        on_circuit_close=lambda: closed.append(True),
+    )
+
+    for _ in range(2):
+        try:
+            with cb:
+                raise RuntimeError("fail")
+        except RuntimeError:
+            pass
+
+    time.sleep(0.1)  # let open_s expire
+
+    with cb:
+        pass  # probe succeeds → circuit closes
+
+    assert closed == [True]
+
+
 # ---------------------------------------------------------------------------
 # DeafnessProbe unit tests
 # ---------------------------------------------------------------------------
@@ -926,7 +996,10 @@ def test_stream_and_play_preserves_raw_text_in_transcript():
     the transcript records what the LLM actually generated, not the TTS-cleaned
     version.
     """
+    import logging
+
     from meeting_agent.llm import Conversation
+    from meeting_agent.trace import Tracer
 
     mock_llm = MagicMock()
     mock_llm.respond_stream.return_value = iter(["Here's **what** I think."])
@@ -937,9 +1010,20 @@ def test_stream_and_play_preserves_raw_text_in_transcript():
     pipeline = Pipeline(PipelineConfig())
     conversation = Conversation()
     conversation.latest_turn = Turn(speaker="Jason", text="Question")
+    noop_tracer = Tracer(
+        enabled=False, verbose=False, logger=logging.getLogger("meeting_agent.trace")
+    )
 
     with patch("meeting_agent.audio.play"):
-        raw = pipeline._stream_and_play(PipelineConfig(), conversation, mock_llm, mock_tts, 0.0)
+        raw = pipeline._stream_and_play(
+            PipelineConfig(),
+            conversation,
+            mock_llm,
+            mock_tts,
+            0.0,
+            noop_tracer,
+            "Question",
+        )
 
     # Return value must be the unfiltered LLM output.
     assert raw == "Here's **what** I think."

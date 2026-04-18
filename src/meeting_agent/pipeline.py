@@ -26,7 +26,7 @@ import re
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -36,10 +36,10 @@ from meeting_agent.asr import StreamingASR, Utterance
 from meeting_agent.audio import AudioArray
 from meeting_agent.classifier import Classifier, Confidence, SessionState
 from meeting_agent.llm import BedrockClient, Conversation, ProjectContext, Turn
+from meeting_agent.trace import Tracer
+from meeting_agent.trace import install as _install_trace
 from meeting_agent.tts import SAMPLE_RATE as TTS_SAMPLE_RATE
 from meeting_agent.tts import TTS
-
-_metrics = logging.getLogger("meeting_agent.metrics")
 
 _CHUNK_MS = 100
 _ECHO_TAIL_S = 0.5  # extra drain time past playback to flush speaker echo
@@ -64,6 +64,9 @@ class CircuitBreaker:
 
     Opens after ``fail_threshold`` failures within ``fail_window_s`` seconds.
     Stays open for ``open_s`` seconds, then goes half-open (one probe allowed).
+
+    Optional callbacks are fired on state transitions so callers can emit
+    structured trace events without coupling the breaker to the trace module.
     """
 
     def __init__(
@@ -71,6 +74,10 @@ class CircuitBreaker:
         fail_threshold: int = 3,
         fail_window_s: float = 10.0,
         open_s: float = 15.0,
+        *,
+        on_circuit_open: Callable[[int], None] | None = None,
+        on_circuit_half_open: Callable[[], None] | None = None,
+        on_circuit_close: Callable[[], None] | None = None,
     ) -> None:
         """Initialise closed circuit."""
         self._failures: deque[float] = deque()
@@ -78,13 +85,23 @@ class CircuitBreaker:
         self._fail_threshold = fail_threshold
         self._fail_window_s = fail_window_s
         self._open_s = open_s
+        self._in_probe = False
+        self._on_circuit_open = on_circuit_open
+        self._on_circuit_half_open = on_circuit_half_open
+        self._on_circuit_close = on_circuit_close
 
     def __enter__(self) -> CircuitBreaker:
         """Check if circuit is open; raise :class:`CircuitBreakerOpen` if so."""
         if self._opened_at is not None:
             if time.monotonic() - self._opened_at < self._open_s:
                 raise CircuitBreakerOpen()
-            self._opened_at = None  # half-open probe
+            # Half-open: allow one probe.
+            self._opened_at = None
+            self._in_probe = True
+            if self._on_circuit_half_open is not None:
+                self._on_circuit_half_open()
+        else:
+            self._in_probe = False
         return self
 
     def __exit__(
@@ -95,6 +112,7 @@ class CircuitBreaker:
     ) -> None:
         """Record any exception as a failure; open circuit if threshold reached."""
         if exc is not None:
+            self._in_probe = False
             now = time.monotonic()
             self._failures.append(now)
             # Prune failures outside the window.
@@ -102,6 +120,13 @@ class CircuitBreaker:
                 self._failures.popleft()
             if len(self._failures) >= self._fail_threshold:
                 self._opened_at = now
+                if self._on_circuit_open is not None:
+                    self._on_circuit_open(len(self._failures))
+        elif self._in_probe:
+            # Half-open probe succeeded → circuit closes.
+            self._in_probe = False
+            if self._on_circuit_close is not None:
+                self._on_circuit_close()
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +193,16 @@ class DeafnessProbe:
         """Mark the probe as fired; subsequent ``should_probe()`` calls return False."""
         self._used = True
 
+    @property
+    def drop_count(self) -> int:
+        """Return the number of drops in the current window."""
+        return len(self._drops)
+
+    @property
+    def window_s(self) -> float:
+        """Return the sliding window duration in seconds."""
+        return self._window_s
+
 
 # ---------------------------------------------------------------------------
 # Pre-classifier confidence gate
@@ -233,6 +268,9 @@ class PipelineConfig:
     classifier_model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
     asr_initial_prompt: str | None = None
     context: ProjectContext = field(default_factory=lambda: ProjectContext(system_prompt=""))
+    trace_enabled: bool = False
+    trace_verbose: bool = False
+    trace_log_dir: Path | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -270,9 +308,24 @@ class Pipeline:
 
         # Robustness scaffolding.
         airtime = AirtimeTracker()
-        circuit_breaker = CircuitBreaker()
-        probe = DeafnessProbe()
         exc_log = _install_exception_log()
+        probe = DeafnessProbe()
+
+        # Dev-mode trace log.
+        tracer, listener = _install_trace(
+            enabled=config.trace_enabled,
+            verbose=config.trace_verbose,
+            log_dir=config.trace_log_dir,
+        )
+
+        # Circuit breaker with trace callbacks.
+        circuit_breaker = CircuitBreaker(
+            on_circuit_open=lambda count: tracer.emit(
+                "circuit_open", failure_count=count, open_duration_s=15.0
+            ),
+            on_circuit_half_open=lambda: tracer.emit("circuit_half_open_probe"),
+            on_circuit_close=lambda: tracer.emit("circuit_close"),
+        )
 
         try:
             for utterance in asr.transcribe_stream(chunks_iter):
@@ -283,7 +336,22 @@ class Pipeline:
                 # ------------------------------------------------------------------
                 if _is_low_confidence(utterance):
                     probe.record_drop()
+                    tracer.emit(
+                        "pre_gate_drop",
+                        utterance_text=utterance.text,
+                        reason="low_confidence",
+                        asr_confidence={
+                            "avg_logprob": utterance.avg_logprob,
+                            "no_speech_prob": utterance.no_speech_prob,
+                            "compression_ratio": utterance.compression_ratio,
+                        },
+                    )
                     if probe.should_probe():
+                        tracer.emit(
+                            "deafness_probe_fired",
+                            consecutive_drops=probe.drop_count,
+                            window_s=probe.window_s,
+                        )
                         for chunk in tts.stream_synthesize(DeafnessProbe.PROBE_TEXT):
                             audio.play(
                                 chunk,
@@ -305,6 +373,19 @@ class Pipeline:
                     continue
 
                 # ------------------------------------------------------------------
+                # Emit utterance_received trace event (gate passed)
+                # ------------------------------------------------------------------
+                tracer.emit(
+                    "utterance_received",
+                    utterance_text=utterance.text,
+                    utterance_start_s=utterance.start_s,
+                    utterance_end_s=utterance.end_s,
+                    asr_avg_logprob=utterance.avg_logprob,
+                    asr_no_speech_prob=utterance.no_speech_prob,
+                    asr_compression_ratio=utterance.compression_ratio,
+                )
+
+                # ------------------------------------------------------------------
                 # Classify
                 # ------------------------------------------------------------------
                 session = SessionState(
@@ -319,10 +400,31 @@ class Pipeline:
                 )
                 decision = classifier.classify(utterance, confidence, config.context, session)
 
+                if tracer.enabled:
+                    tracer.emit(
+                        "classifier_decision",
+                        utterance_text=utterance.text,
+                        utterance_age_s=time.monotonic() - utterance_arrival_monotonic,
+                        asr_confidence={
+                            "avg_logprob": utterance.avg_logprob,
+                            "no_speech_prob": utterance.no_speech_prob,
+                            "compression_ratio": utterance.compression_ratio,
+                        },
+                        recent_turns_snapshot=[
+                            {"speaker": t.speaker, "text": t.text} for t in session.recent_turns
+                        ],
+                        agent_turns_last_30s=session.agent_turns_last_30s,
+                        agent_turns_last_5min=session.agent_turns_last_5min,
+                        decision_speaker=decision.speaker,
+                        decision_action=decision.action,
+                        decision_confidence=decision.confidence,
+                    )
+
                 # ------------------------------------------------------------------
                 # Silent? Append turn and continue listening.
                 # ------------------------------------------------------------------
                 if decision.action == "silent":
+                    tracer.emit("decision_outcome", outcome="silent")
                     conversation.older_turns.append(
                         Turn(speaker=decision.speaker, text=utterance.text)
                     )
@@ -333,6 +435,7 @@ class Pipeline:
                 # ------------------------------------------------------------------
                 age = time.monotonic() - utterance_arrival_monotonic
                 if age > _STALE_DROP_S:
+                    tracer.emit("decision_outcome", outcome="stale_drop", age_s=age)
                     exc_log.info(
                         json.dumps(
                             {
@@ -346,6 +449,11 @@ class Pipeline:
                 action = decision.action
                 if age > _STALE_HEDGE_S and action == "full_answer":
                     action = "hedged_answer"  # downgrade
+                    tracer.emit(
+                        "decision_outcome",
+                        outcome="downgraded_by_staleness",
+                        age_s=age,
+                    )
 
                 # ------------------------------------------------------------------
                 # Respond (Bedrock Sonnet + TTS, circuit-breaker guarded)
@@ -355,10 +463,17 @@ class Pipeline:
                     with circuit_breaker:
                         t_speak_start = time.monotonic()
                         full_response = self._stream_and_play(
-                            config, conversation, llm, tts, utterance_arrival_monotonic
+                            config,
+                            conversation,
+                            llm,
+                            tts,
+                            utterance_arrival_monotonic,
+                            tracer,
+                            utterance.text,
                         )
                         speak_duration = time.monotonic() - t_speak_start
                 except CircuitBreakerOpen:
+                    tracer.emit("decision_outcome", outcome="circuit_open_skip")
                     exc_log.info(json.dumps({"event": "circuit_open"}))
                     conversation.latest_turn = None
                     continue
@@ -373,6 +488,10 @@ class Pipeline:
                     )
                     conversation.latest_turn = None
                     continue
+
+                # Emit outcome after successful response
+                outcome = "responded_full" if action == "full_answer" else "responded_hedged"
+                tracer.emit("decision_outcome", outcome=outcome)
 
                 # ------------------------------------------------------------------
                 # Commit exchange to rolling transcript
@@ -390,6 +509,9 @@ class Pipeline:
 
         except KeyboardInterrupt:
             pass
+        finally:
+            if listener is not None:
+                listener.stop()
 
     # ------------------------------------------------------------------
     # Named pipeline stages — kept separate for testability.
@@ -419,6 +541,8 @@ class Pipeline:
         llm: BedrockClient,
         tts: TTS,
         t_asr_done: float,
+        tracer: Tracer,
+        utterance_text: str,
     ) -> str:
         """Stream Claude's response, pipeline TTS on sentence boundaries.
 
@@ -430,12 +554,10 @@ class Pipeline:
         inside this call, so ASR chunk consumption is suspended for the duration
         of agent speech.
 
-        Latency events logged to ``meeting_agent.metrics``:
+        Timing events are emitted via *tracer* when trace is enabled:
 
-        * ``bedrock_ttft_s`` — time from end-of-utterance to first LLM delta.
-        * ``tts_pipeline_overhead_s`` — time from first LLM delta to first
-          TTS audio chunk.
-        * ``total_turn_latency_s`` — utterance-to-first-speaker-audio latency.
+        * ``response_emitted`` — full response with bedrock_ttft_s,
+          tts_pipeline_overhead_s, and total_turn_latency_s.
 
         Args:
             config: Pipeline config (output device, project context, model id).
@@ -443,6 +565,8 @@ class Pipeline:
             llm: Bedrock client for streaming the response.
             tts: TTS instance for synthesis.
             t_asr_done: Monotonic timestamp when ASR finished (latency anchor).
+            tracer: Trace emitter (no-op when disabled).
+            utterance_text: Text of the triggering utterance (for trace records).
 
         Returns:
             The full agent response as a single concatenated string.
@@ -459,14 +583,7 @@ class Pipeline:
                     return
                 for chunk in tts.stream_synthesize(sentence):
                     if not first_audio_t:
-                        t = time.monotonic()
-                        first_audio_t.append(t)
-                        if first_delta_t:
-                            _metrics.info(
-                                "tts_pipeline_overhead_s=%.3f",
-                                t - first_delta_t[0],
-                            )
-                        _metrics.info("total_turn_latency_s=%.3f", t - t_asr_done)
+                        first_audio_t.append(time.monotonic())
                     audio.play(
                         chunk,
                         sample_rate=TTS_SAMPLE_RATE,
@@ -483,9 +600,7 @@ class Pipeline:
         try:
             for delta in llm.respond_stream(config.context, conversation):
                 if not first_delta_logged:
-                    t = time.monotonic()
-                    first_delta_t.append(t)
-                    _metrics.info("bedrock_ttft_s=%.3f", t - t_asr_done)
+                    first_delta_t.append(time.monotonic())
                     first_delta_logged = True
 
                 full_response += delta
@@ -504,6 +619,20 @@ class Pipeline:
                 sentence_q.put(tail_cleaned)
             sentence_q.put(None)  # sentinel — stops the worker
             worker.join()
+
+            # Emit the response_emitted trace event now that all timing is known.
+            tracer.emit(
+                "response_emitted",
+                triggering_utterance=utterance_text,
+                response_text=full_response,
+                bedrock_ttft_s=first_delta_t[0] - t_asr_done if first_delta_t else None,
+                tts_pipeline_overhead_s=(
+                    (first_audio_t[0] - first_delta_t[0])
+                    if (first_delta_t and first_audio_t)
+                    else None
+                ),
+                total_turn_latency_s=first_audio_t[0] - t_asr_done if first_audio_t else None,
+            )
 
         return full_response
 
