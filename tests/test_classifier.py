@@ -449,6 +449,17 @@ def test_ollama_temperature_zero_and_num_predict():
     assert options["num_predict"] == 256
 
 
+def test_ollama_think_disabled():
+    """classify() passes think=False so reasoning models don't eat the output budget."""
+    mock_client = MagicMock()
+    mock_client.chat.return_value = _make_ollama_response("x", "silent", 0.0)
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier()
+        classifier.classify(_make_utterance(), _make_confidence(), _make_context(), _make_session())
+
+    assert mock_client.chat.call_args[1]["think"] is False
+
+
 # ---------------------------------------------------------------------------
 # OllamaClassifier: response parsing tests
 # ---------------------------------------------------------------------------

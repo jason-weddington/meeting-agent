@@ -178,7 +178,7 @@ in the meeting, decide two things: (1) who said it, (2) what the agent should do
 
 # Your output
 
-Return a `classify` tool call with three fields:
+Return a JSON object with three fields:
 
 - speaker: The attributed speaker's name from the known roster above, or the
   string "unknown" if you cannot confidently attribute. Use the speech-pattern
@@ -430,6 +430,7 @@ class OllamaClassifier:
             self._get_client().chat(
                 model=self.model,
                 messages=[{"role": "user", "content": "ok"}],
+                think=False,
                 options={"temperature": 0.0, "num_predict": 1},
             )
             return True
@@ -471,6 +472,11 @@ class OllamaClassifier:
                     {"role": "user", "content": user},
                 ],
                 format=_DECISION_JSON_SCHEMA,
+                # Qwen3-family models are "hybrid reasoners" — with thinking
+                # enabled, the reasoning chain consumes the whole output budget
+                # and `message.content` comes back empty. We only need the
+                # structured decision, not the chain-of-thought.
+                think=False,
                 options={"temperature": 0.0, "num_predict": 256},
             )
             text = response["message"]["content"]
