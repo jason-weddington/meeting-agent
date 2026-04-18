@@ -80,7 +80,6 @@ def test_default_flags_produce_expected_pipeline_config(monkeypatch):
 
     assert config.input_device is None
     assert config.output_device is None
-    assert config.wake_phrase == "hey_jarvis"
     assert config.model_id == DEFAULT_MODEL_ID
     assert config.asr_initial_prompt is None
     assert config.context.system_prompt == DEFAULT_SYSTEM_PROMPT
@@ -98,8 +97,6 @@ def test_custom_flags_produce_expected_pipeline_config():
         "3",
         "--output-device",
         "5",
-        "--wake-phrase",
-        "hey_claude",
         "--model-id",
         "us.anthropic.claude-opus-4-5",
         "--initial-prompt",
@@ -113,7 +110,6 @@ def test_custom_flags_produce_expected_pipeline_config():
 
     assert config.input_device == 3
     assert config.output_device == 5
-    assert config.wake_phrase == "hey_claude"
     assert config.model_id == "us.anthropic.claude-opus-4-5"
     assert config.asr_initial_prompt == "AWS EKS S3 Lambda"
     assert config.context.system_prompt == "Be terse."

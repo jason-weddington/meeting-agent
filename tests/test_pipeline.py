@@ -1,17 +1,29 @@
-"""Tests for meeting_agent.pipeline — orchestrator and TTS pipelining."""
+"""Tests for meeting_agent.pipeline — V2 always-on, classifier-gated pipeline."""
 
 from __future__ import annotations
 
-import threading
+import logging
 import time
 from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 
 from meeting_agent.asr import Utterance
-from meeting_agent.llm import Conversation, Turn
-from meeting_agent.pipeline import Pipeline, PipelineConfig, _split_at_sentence_boundaries
+from meeting_agent.classifier import Decision
+from meeting_agent.llm import Turn
+from meeting_agent.pipeline import (
+    AirtimeTracker,
+    CircuitBreaker,
+    CircuitBreakerOpen,
+    DeafnessProbe,
+    Pipeline,
+    PipelineConfig,
+    _install_exception_log,
+    _is_low_confidence,
+    _split_at_sentence_boundaries,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -27,41 +39,58 @@ def _infinite_chunks() -> Iterator[np.ndarray]:  # type: ignore[type-arg]
         yield _FAKE_MIC_CHUNK.copy()
 
 
-def _make_mocks(
+def _make_utterance(
+    text: str = "Test utterance",
+    start_s: float = 0.0,
+    end_s: float = 2.0,
+    avg_logprob: float = -0.3,
+    no_speech_prob: float = 0.05,
+    compression_ratio: float = 1.2,
+) -> Utterance:
+    """Build a high-confidence Utterance for testing."""
+    return Utterance(
+        text=text,
+        start_s=start_s,
+        end_s=end_s,
+        avg_logprob=avg_logprob,
+        no_speech_prob=no_speech_prob,
+        compression_ratio=compression_ratio,
+    )
+
+
+def _full_answer_decision(speaker: str = "Jason") -> Decision:
+    return Decision(speaker=speaker, action="full_answer", confidence=0.9)
+
+
+def _silent_decision(speaker: str = "Jason") -> Decision:
+    return Decision(speaker=speaker, action="silent", confidence=0.9)
+
+
+def _make_v2_mocks(
     *,
-    lm_deltas: list[str],
-    utterance_text: str = "Test utterance",
+    utterances: list[Utterance],
+    decisions: list[Decision] | None = None,
+    lm_deltas: list[str] | None = None,
     tts_audio: np.ndarray | None = None,  # type: ignore[type-arg]
-    detect_true_on: int = 0,
-    raise_keyboard_interrupt_on: int = 1,
 ) -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
-    """Build component mocks for a single-turn pipeline run.
+    """Build V2 component mocks (no wake detector).
 
     Returns:
-        (mock_wake_instance, mock_asr_instance, mock_llm_instance,
-         mock_tts_instance)
+        (mock_asr, mock_classifier, mock_llm, mock_tts)
     """
     if tts_audio is None:
         tts_audio = _FAKE_AUDIO_CHUNK
-
-    detect_call_count: list[int] = [0]
-
-    def _fake_detect(chunk: np.ndarray) -> bool:  # type: ignore[type-arg]
-        idx = detect_call_count[0]
-        detect_call_count[0] += 1
-        if idx == detect_true_on:
-            return True
-        if idx == raise_keyboard_interrupt_on:
-            raise KeyboardInterrupt
-        return False
-
-    mock_wake = MagicMock()
-    mock_wake.detect.side_effect = _fake_detect
+    if lm_deltas is None:
+        lm_deltas = ["Agent reply."]
 
     mock_asr = MagicMock()
-    mock_asr.transcribe_stream.return_value = iter(
-        [Utterance(text=utterance_text, start_s=0.0, end_s=2.0)]
-    )
+    mock_asr.transcribe_stream.return_value = iter(utterances)
+
+    mock_classifier = MagicMock()
+    if decisions is not None:
+        mock_classifier.classify.side_effect = decisions
+    else:
+        mock_classifier.classify.return_value = _full_answer_decision()
 
     mock_llm = MagicMock()
     mock_llm.respond_stream.return_value = iter(lm_deltas)
@@ -69,27 +98,28 @@ def _make_mocks(
     mock_tts = MagicMock()
     mock_tts.stream_synthesize.return_value = iter([tts_audio])
 
-    return mock_wake, mock_asr, mock_llm, mock_tts
+    return mock_asr, mock_classifier, mock_llm, mock_tts
 
 
-def _run_pipeline(
-    mock_wake: MagicMock,
+def _run_v2_pipeline(
     mock_asr: MagicMock,
+    mock_classifier: MagicMock,
     mock_llm: MagicMock,
     mock_tts: MagicMock,
     config: PipelineConfig | None = None,
 ) -> Pipeline:
-    """Patch all five boundaries and run Pipeline.run() to completion."""
+    """Patch all V2 boundaries and run Pipeline.run() to completion."""
     if config is None:
         config = PipelineConfig()
 
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
-        patch("meeting_agent.pipeline.WakeDetector", return_value=mock_wake),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
     ):
         pipeline = Pipeline(config)
         pipeline.run()
@@ -97,7 +127,7 @@ def _run_pipeline(
 
 
 # ---------------------------------------------------------------------------
-# _split_at_sentence_boundaries unit tests
+# _split_at_sentence_boundaries unit tests (unchanged helper)
 # ---------------------------------------------------------------------------
 
 
@@ -151,389 +181,36 @@ def test_split_accumulation_pattern():
 
 
 # ---------------------------------------------------------------------------
-# Main loop: call order and args
+# _is_low_confidence unit tests
 # ---------------------------------------------------------------------------
 
 
-def test_main_loop_calls_stages_in_order():
-    """Main loop: wake → ASR → LLM → TTS → play, in the right order."""
-    mock_wake, mock_asr, mock_llm, mock_tts = _make_mocks(lm_deltas=["Hello."])
-
-    call_order: list[str] = []
-
-    detect_count: list[int] = [0]
-
-    def ordered_detect(chunk: np.ndarray) -> bool:  # type: ignore[type-arg]
-        n = detect_count[0]
-        detect_count[0] += 1
-        call_order.append("detect")
-        if n == 0:
-            return True
-        raise KeyboardInterrupt
-
-    def ordered_synth(text: str) -> Iterator[np.ndarray]:  # type: ignore[type-arg]
-        call_order.append("synth")
-        yield _FAKE_AUDIO_CHUNK
-
-    def ordered_play(
-        chunk: np.ndarray,  # type: ignore[type-arg]
-        sample_rate: int,
-        device: int | None = None,
-    ) -> None:
-        call_order.append("play")
-
-    mock_wake.detect.side_effect = ordered_detect
-    mock_tts.stream_synthesize.side_effect = ordered_synth
-
-    with (
-        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
-        patch("meeting_agent.pipeline.WakeDetector", return_value=mock_wake),
-        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
-        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
-        patch("meeting_agent.audio.play", side_effect=ordered_play),
-    ):
-        Pipeline(PipelineConfig()).run()
-
-    assert "detect" in call_order
-    assert "synth" in call_order
-    assert "play" in call_order
-    # detect must precede synth and play
-    first_detect = call_order.index("detect")
-    first_synth = call_order.index("synth")
-    first_play = call_order.index("play")
-    assert first_detect < first_synth
-    assert first_detect < first_play
+def test_is_low_confidence_clean_utterance():
+    """Normal transcription is not flagged as low-confidence."""
+    u = _make_utterance(avg_logprob=-0.3, no_speech_prob=0.05, compression_ratio=1.2)
+    assert not _is_low_confidence(u)
 
 
-def test_wake_detector_constructed_with_config_phrase():
-    """WakeDetector is created with the phrase from PipelineConfig."""
-    mock_wake, mock_asr, mock_llm, mock_tts = _make_mocks(lm_deltas=["Hi."])
-    config = PipelineConfig(wake_phrase="hey_claude")
-
-    with (
-        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
-        patch("meeting_agent.pipeline.WakeDetector", return_value=mock_wake) as MockWake,
-        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
-        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
-        patch("meeting_agent.audio.play"),
-    ):
-        Pipeline(config).run()
-
-    MockWake.assert_called_once_with("hey_claude")
+def test_is_low_confidence_bad_logprob():
+    """avg_logprob below -1.0 triggers low-confidence."""
+    u = _make_utterance(avg_logprob=-1.5, no_speech_prob=0.05, compression_ratio=1.2)
+    assert _is_low_confidence(u)
 
 
-def test_bedrock_client_constructed_with_model_id():
-    """BedrockClient is created with model_id from PipelineConfig."""
-    mock_wake, mock_asr, mock_llm, mock_tts = _make_mocks(lm_deltas=["Hi."])
-    config = PipelineConfig(model_id="us.anthropic.claude-opus-4-5")
-
-    with (
-        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
-        patch("meeting_agent.pipeline.WakeDetector", return_value=mock_wake),
-        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm) as MockLLM,
-        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
-        patch("meeting_agent.audio.play"),
-    ):
-        Pipeline(config).run()
-
-    MockLLM.assert_called_once_with(model_id="us.anthropic.claude-opus-4-5")
+def test_is_low_confidence_high_no_speech():
+    """no_speech_prob above 0.6 triggers low-confidence."""
+    u = _make_utterance(avg_logprob=-0.3, no_speech_prob=0.7, compression_ratio=1.2)
+    assert _is_low_confidence(u)
 
 
-def test_llm_respond_stream_receives_correct_user_turn():
-    """respond_stream is called with the transcribed utterance as latest_turn."""
-    # Capture a snapshot of the Conversation object AT CALL TIME (the object is
-    # mutated after respond_stream returns, so call_args would show stale state).
-    captured_latest_turn: list[Turn | None] = []
-
-    def capturing_respond_stream(context: object, conv: Conversation) -> Iterator[str]:
-        captured_latest_turn.append(conv.latest_turn)
-        yield "Got it."
-
-    mock_wake, mock_asr, mock_llm, mock_tts = _make_mocks(
-        lm_deltas=[],  # overridden by side_effect below
-        utterance_text="What is the project status?",
-    )
-    mock_llm.respond_stream.side_effect = capturing_respond_stream
-
-    _run_pipeline(mock_wake, mock_asr, mock_llm, mock_tts)
-
-    assert len(captured_latest_turn) == 1
-    turn = captured_latest_turn[0]
-    assert turn is not None
-    assert turn.text == "What is the project status?"
-    assert turn.speaker == "user"
-
-
-def test_tts_stream_synthesize_called_with_first_sentence():
-    """stream_synthesize is called with the first complete sentence."""
-    mock_wake, mock_asr, mock_llm, mock_tts = _make_mocks(lm_deltas=["Hello."])
-    _run_pipeline(mock_wake, mock_asr, mock_llm, mock_tts)
-
-    mock_tts.stream_synthesize.assert_called_once_with("Hello.")
-
-
-def test_play_called_with_tts_audio_chunk():
-    """audio.play is called with the TTS audio chunk and TTS sample rate."""
-    from meeting_agent.tts import SAMPLE_RATE as TTS_SR
-
-    mock_wake, mock_asr, mock_llm, mock_tts = _make_mocks(lm_deltas=["Hi."])
-
-    with (
-        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
-        patch("meeting_agent.pipeline.WakeDetector", return_value=mock_wake),
-        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
-        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
-        patch("meeting_agent.audio.play") as mock_play,
-    ):
-        Pipeline(PipelineConfig()).run()
-
-    assert mock_play.called
-    play_kwargs = mock_play.call_args
-    assert play_kwargs[1]["sample_rate"] == TTS_SR or play_kwargs[0][1] == TTS_SR
+def test_is_low_confidence_high_compression():
+    """compression_ratio above 2.4 triggers low-confidence."""
+    u = _make_utterance(avg_logprob=-0.3, no_speech_prob=0.05, compression_ratio=2.5)
+    assert _is_low_confidence(u)
 
 
 # ---------------------------------------------------------------------------
-# Rolling transcript
-# ---------------------------------------------------------------------------
-
-
-def test_rolling_transcript_after_one_turn():
-    """First LLM call sees empty older_turns; transcript is empty at turn start."""
-    # Capture a snapshot of older_turns AT CALL TIME to verify the conversation
-    # starts with no history on the first turn.
-    captured_older_turns: list[list[Turn]] = []
-
-    def capturing_respond_stream(context: object, conv: Conversation) -> Iterator[str]:
-        captured_older_turns.append(list(conv.older_turns))
-        yield "Agent reply."
-
-    mock_wake, mock_asr, mock_llm, mock_tts = _make_mocks(
-        lm_deltas=[],
-        utterance_text="User said this",
-    )
-    mock_llm.respond_stream.side_effect = capturing_respond_stream
-
-    _run_pipeline(mock_wake, mock_asr, mock_llm, mock_tts)
-
-    assert len(captured_older_turns) == 1
-    assert captured_older_turns[0] == []  # no history on first turn
-
-
-def test_rolling_transcript_older_turns_populated_after_turn():
-    """After one full exchange, the second LLM call sees both turns in older_turns."""
-    # Run TWO turns. On the second turn, capture a snapshot of older_turns.
-    # This verifies that run() correctly appended [user_turn, agent_turn] after
-    # the first exchange.
-    detect_count: list[int] = [0]
-
-    def two_turn_detect(chunk: np.ndarray) -> bool:  # type: ignore[type-arg]
-        n = detect_count[0]
-        detect_count[0] += 1
-        if n in (0, 2):  # wake on first chunk of each turn
-            return True
-        if n == 4:  # exit after second turn completes
-            raise KeyboardInterrupt
-        return False
-
-    mock_wake = MagicMock()
-    mock_wake.detect.side_effect = two_turn_detect
-
-    mock_asr = MagicMock()
-    mock_asr.transcribe_stream.side_effect = [
-        iter([Utterance(text="First question", start_s=0.0, end_s=1.0)]),
-        iter([Utterance(text="Second question", start_s=2.0, end_s=3.0)]),
-    ]
-
-    # Capture snapshots of older_turns at each LLM call time
-    captured_older_turns: list[list[Turn]] = []
-
-    def capturing_respond_stream(context: object, conv: Conversation) -> Iterator[str]:
-        captured_older_turns.append(list(conv.older_turns))
-        if len(captured_older_turns) == 1:
-            yield "First answer."
-        else:
-            yield "Second answer."
-
-    mock_llm = MagicMock()
-    mock_llm.respond_stream.side_effect = capturing_respond_stream
-
-    mock_tts = MagicMock()
-    mock_tts.stream_synthesize.return_value = iter([_FAKE_AUDIO_CHUNK])
-
-    with (
-        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
-        patch("meeting_agent.pipeline.WakeDetector", return_value=mock_wake),
-        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
-        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
-        patch("meeting_agent.audio.play"),
-    ):
-        Pipeline(PipelineConfig()).run()
-
-    assert mock_llm.respond_stream.call_count == 2
-    # First turn: no prior history
-    assert captured_older_turns[0] == []
-    # Second turn: first exchange must be in older_turns
-    assert len(captured_older_turns[1]) == 2
-    assert captured_older_turns[1][0] == Turn(speaker="user", text="First question")
-    assert captured_older_turns[1][1] == Turn(speaker="agent", text="First answer.")
-
-
-# ---------------------------------------------------------------------------
-# First-sentence TTS pipelining
-# ---------------------------------------------------------------------------
-
-
-def test_first_sentence_pipelining():
-    """stream_synthesize("Hello.") is called before LLM yields all deltas."""
-    # Synchronisation: LLM blocks after yielding "." until TTS has been
-    # called with "Hello.", proving the worker thread consumed the sentence
-    # before the LLM finished streaming.
-    first_sentence_tts_called = threading.Event()
-
-    def pipelining_lm_gen(context: object, conv: object) -> Iterator[str]:
-        yield "Hello"
-        yield "."
-        # Block until the worker thread calls stream_synthesize("Hello.")
-        assert first_sentence_tts_called.wait(timeout=5.0), (
-            "stream_synthesize was not called with 'Hello.' before LLM continued"
-        )
-        yield " world"
-        yield "!"
-
-    synth_call_args: list[str] = []
-
-    def fake_stream_synthesize(text: str) -> Iterator[np.ndarray]:  # type: ignore[type-arg]
-        synth_call_args.append(text)
-        if text == "Hello.":
-            first_sentence_tts_called.set()
-        yield _FAKE_AUDIO_CHUNK
-
-    detect_count: list[int] = [0]
-
-    def single_turn_detect(chunk: np.ndarray) -> bool:  # type: ignore[type-arg]
-        n = detect_count[0]
-        detect_count[0] += 1
-        if n == 0:
-            return True
-        raise KeyboardInterrupt
-
-    mock_wake = MagicMock()
-    mock_wake.detect.side_effect = single_turn_detect
-
-    mock_asr = MagicMock()
-    mock_asr.transcribe_stream.return_value = iter(
-        [Utterance(text="Hello?", start_s=0.0, end_s=1.0)]
-    )
-
-    mock_llm = MagicMock()
-    mock_llm.respond_stream.side_effect = pipelining_lm_gen
-
-    mock_tts = MagicMock()
-    mock_tts.stream_synthesize.side_effect = fake_stream_synthesize
-
-    with (
-        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
-        patch("meeting_agent.pipeline.WakeDetector", return_value=mock_wake),
-        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
-        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
-        patch("meeting_agent.audio.play"),
-    ):
-        Pipeline(PipelineConfig()).run()
-
-    assert synth_call_args == ["Hello.", " world!"], (
-        f"Expected ['Hello.', ' world!'], got {synth_call_args}"
-    )
-    assert first_sentence_tts_called.is_set(), "stream_synthesize was never called with 'Hello.'"
-
-
-def test_unpunctuated_response_still_synthesised():
-    """A response with no sentence-ending punctuation is still synthesised."""
-    mock_wake, mock_asr, mock_llm, mock_tts = _make_mocks(
-        lm_deltas=["Sure", " thing"],
-    )
-    _run_pipeline(mock_wake, mock_asr, mock_llm, mock_tts)
-
-    # Full text "Sure thing" has no terminal punctuation → flushed as tail
-    mock_tts.stream_synthesize.assert_called_once_with("Sure thing")
-
-
-def test_multi_sentence_response_synthesised_in_order():
-    """Multiple complete sentences are sent to TTS in order."""
-    mock_wake, mock_asr, mock_llm, mock_tts = _make_mocks(
-        lm_deltas=["First.", " Second.", " Third."],
-    )
-    _run_pipeline(mock_wake, mock_asr, mock_llm, mock_tts)
-
-    calls = [c[0][0] for c in mock_tts.stream_synthesize.call_args_list]
-    assert calls == ["First.", " Second.", " Third."]
-
-
-# ---------------------------------------------------------------------------
-# Mic gating during agent speech
-# ---------------------------------------------------------------------------
-
-
-def test_mic_gating_during_speech():
-    """Wake detector is not called while TTS audio is being played."""
-    playing = threading.Event()
-    detect_during_play: list[bool] = []
-
-    detect_count: list[int] = [0]
-
-    def gating_detect(chunk: np.ndarray) -> bool:  # type: ignore[type-arg]
-        # Record whether we're currently inside a play() call
-        detect_during_play.append(playing.is_set())
-        n = detect_count[0]
-        detect_count[0] += 1
-        if n == 0:
-            return True
-        raise KeyboardInterrupt
-
-    def gating_play(
-        chunk: np.ndarray,  # type: ignore[type-arg]
-        sample_rate: int,
-        device: int | None = None,
-    ) -> None:
-        playing.set()
-        time.sleep(0.005)  # give other threads a chance to run
-        playing.clear()
-
-    mock_wake = MagicMock()
-    mock_wake.detect.side_effect = gating_detect
-
-    mock_asr = MagicMock()
-    mock_asr.transcribe_stream.return_value = iter([Utterance(text="Hi", start_s=0.0, end_s=0.5)])
-
-    mock_llm = MagicMock()
-    mock_llm.respond_stream.return_value = iter(["Answer."])
-
-    mock_tts = MagicMock()
-    mock_tts.stream_synthesize.return_value = iter([_FAKE_AUDIO_CHUNK])
-
-    with (
-        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
-        patch("meeting_agent.pipeline.WakeDetector", return_value=mock_wake),
-        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
-        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
-        patch("meeting_agent.audio.play", side_effect=gating_play),
-    ):
-        Pipeline(PipelineConfig()).run()
-
-    # No detect() call should have occurred while playing was set
-    assert all(not was_playing for was_playing in detect_during_play), (
-        "detect() was called while TTS audio was playing — mic gating failed"
-    )
-
-
-# ---------------------------------------------------------------------------
-# KeyboardInterrupt exits cleanly
+# _drain_echo unit tests (unchanged helper)
 # ---------------------------------------------------------------------------
 
 
@@ -572,111 +249,600 @@ def test_drain_echo_stops_cleanly_when_iterator_exhausts():
 
 
 # ---------------------------------------------------------------------------
-# V1.5: _collect_utterance timeout
+# AirtimeTracker unit tests
 # ---------------------------------------------------------------------------
 
 
-def test_collect_utterance_returns_none_on_timeout():
-    """_collect_utterance returns None when no utterance arrives within timeout_s."""
+def test_airtime_tracker_empty():
+    """Fresh tracker returns 0 for any window."""
+    at = AirtimeTracker()
+    assert at.count_last(30) == 0
+    assert at.count_last(300) == 0
 
-    def _no_utterance_transcribe(chunks_iter: Iterator[np.ndarray]) -> Iterator[Utterance]:
-        # Consume all chunks until the bounded iterator exhausts (deadline reached),
-        # then return without yielding any utterance.
-        for _ in chunks_iter:
+
+def test_airtime_tracker_records_emission():
+    """After recording an emission, count_last returns 1 for a wide window."""
+    at = AirtimeTracker()
+    at.record_emission(time.monotonic())
+    assert at.count_last(30) == 1
+
+
+def test_airtime_tracker_prunes_old_emissions():
+    """Emissions older than 5 minutes are pruned."""
+    at = AirtimeTracker()
+    old = time.monotonic() - 400.0  # 400s ago, outside 300s window
+    at.record_emission(old)
+    # record_emission only prunes relative to the last emission's time
+    at.record_emission(time.monotonic())
+    # The old one should be pruned; the recent one should count
+    assert at.count_last(300) == 1
+
+
+# ---------------------------------------------------------------------------
+# CircuitBreaker unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_circuit_breaker_starts_closed():
+    """Fresh circuit breaker allows entry."""
+    cb = CircuitBreaker()
+    with cb:
+        pass  # must not raise
+
+
+def test_circuit_breaker_opens_after_threshold():
+    """Circuit opens after fail_threshold failures within the window."""
+    cb = CircuitBreaker(fail_threshold=3, fail_window_s=10.0, open_s=15.0)
+
+    # Record 3 failures
+    for _ in range(3):
+        try:
+            with cb:
+                raise RuntimeError("fail")
+        except RuntimeError:
             pass
-        yield from ()  # makes this a generator that yields nothing
 
-    mock_asr = MagicMock()
-    mock_asr.transcribe_stream.side_effect = _no_utterance_transcribe
-
-    pipeline = Pipeline(PipelineConfig())
-    t_start = time.monotonic()
-    result = pipeline._collect_utterance(_infinite_chunks(), mock_asr, timeout_s=0.1)
-    elapsed = time.monotonic() - t_start
-
-    assert result is None
-    # Should have waited roughly timeout_s then returned (not hung indefinitely).
-    assert elapsed < 5.0
+    # Circuit should now be open
+    with pytest.raises(CircuitBreakerOpen):
+        with cb:
+            pass
 
 
-def test_collect_utterance_returns_utterance_before_timeout():
-    """_collect_utterance returns the first utterance when it arrives before timeout."""
-    expected = Utterance(text="real speech", start_s=0.0, end_s=1.0)
+def test_circuit_breaker_half_open_probe():
+    """After open_s, the circuit goes half-open and allows one probe."""
+    cb = CircuitBreaker(fail_threshold=2, fail_window_s=10.0, open_s=0.05)
 
-    def _immediate_transcribe(chunks_iter: Iterator[np.ndarray]) -> Iterator[Utterance]:
-        # Consume one chunk then immediately yield an utterance.
-        next(chunks_iter, None)
-        yield expected
+    # Trip the circuit
+    for _ in range(2):
+        try:
+            with cb:
+                raise RuntimeError("fail")
+        except RuntimeError:
+            pass
 
-    mock_asr = MagicMock()
-    mock_asr.transcribe_stream.side_effect = _immediate_transcribe
+    # Wait for open_s to pass
+    time.sleep(0.1)
 
-    pipeline = Pipeline(PipelineConfig())
-    result = pipeline._collect_utterance(_infinite_chunks(), mock_asr, timeout_s=5.0)
+    # Should allow one probe (half-open)
+    with cb:
+        pass  # succeeds — circuit closes again
 
-    assert result == expected
+
+# ---------------------------------------------------------------------------
+# DeafnessProbe unit tests
+# ---------------------------------------------------------------------------
 
 
-def test_run_loop_continues_after_timeout():
-    """When _collect_utterance returns None, run() loops back to wake without calling LLM/TTS."""
-    detect_count: list[int] = [0]
+def test_deafness_probe_does_not_fire_below_threshold():
+    """Probe does not suggest probing before threshold drops."""
+    dp = DeafnessProbe(threshold=3)
+    dp.record_drop()
+    dp.record_drop()
+    assert not dp.should_probe()
 
-    def _two_wake_detect(chunk: np.ndarray) -> bool:
-        n = detect_count[0]
-        detect_count[0] += 1
-        if n == 0:
-            return True  # trigger wake on first chunk
-        if n == 1:
-            raise KeyboardInterrupt  # exit cleanly on second listen cycle
-        return False
 
-    mock_wake = MagicMock()
-    mock_wake.detect.side_effect = _two_wake_detect
+def test_deafness_probe_fires_at_threshold():
+    """Probe fires exactly when threshold drops is reached."""
+    dp = DeafnessProbe(threshold=3)
+    dp.record_drop()
+    dp.record_drop()
+    dp.record_drop()
+    assert dp.should_probe()
 
-    mock_asr = MagicMock()
-    mock_llm = MagicMock()
-    mock_tts = MagicMock()
+
+def test_deafness_probe_does_not_repeat():
+    """After mark_used(), should_probe() always returns False."""
+    dp = DeafnessProbe(threshold=3)
+    for _ in range(5):
+        dp.record_drop()
+    assert dp.should_probe()
+    dp.mark_used()
+    assert not dp.should_probe()
+
+
+# ---------------------------------------------------------------------------
+# V2 pipeline: classifier integration
+# ---------------------------------------------------------------------------
+
+
+def test_classifier_called_per_utterance():
+    """Classifier is called once per utterance that passes the confidence gate."""
+    utterances = [
+        _make_utterance("First"),
+        _make_utterance("Second"),
+        _make_utterance("Third"),
+    ]
+    decisions = [
+        _silent_decision(),
+        _silent_decision(),
+        _silent_decision(),
+    ]
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=utterances, decisions=decisions
+    )
+    _run_v2_pipeline(mock_asr, mock_classifier, mock_llm, mock_tts)
+
+    assert mock_classifier.classify.call_count == 3
+
+
+def test_silent_decision_appends_and_skips_response():
+    """When classifier returns 'silent', utterance is appended and LLM is not called."""
+    utterance = _make_utterance("Background noise")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_silent_decision(speaker="Jason")],
+    )
 
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
-        patch("meeting_agent.pipeline.WakeDetector", return_value=mock_wake),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
-        patch.object(Pipeline, "_collect_utterance", return_value=None),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
+        patch.object(Pipeline, "_stream_and_play") as mock_sap,
+    ):
+        pipeline = Pipeline(PipelineConfig())
+        pipeline.run()
+
+    mock_llm.respond_stream.assert_not_called()
+    mock_sap.assert_not_called()
+
+
+def test_hedged_and_full_decisions_trigger_response():
+    """When classifier returns 'full_answer', the response pipeline runs."""
+    utterance = _make_utterance("What is the status?")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_full_answer_decision(speaker="Jason")],
+        lm_deltas=["The status is good."],
+    )
+    _run_v2_pipeline(mock_asr, mock_classifier, mock_llm, mock_tts)
+
+    mock_llm.respond_stream.assert_called_once()
+
+
+def test_bedrock_client_constructed_with_model_id():
+    """BedrockClient is created with model_id from PipelineConfig."""
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[],
+    )
+    config = PipelineConfig(model_id="us.anthropic.claude-opus-4-5")
+
+    with (
+        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm) as MockLLM,
+        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+        patch("meeting_agent.audio.play"),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
+    ):
+        Pipeline(config).run()
+
+    MockLLM.assert_called_once_with(model_id="us.anthropic.claude-opus-4-5")
+
+
+# ---------------------------------------------------------------------------
+# V2 pipeline: confidence gate and deafness probe
+# ---------------------------------------------------------------------------
+
+
+def test_low_confidence_gate_drops_utterance():
+    """Utterance with low avg_logprob is dropped before classifier."""
+    low_conf = _make_utterance(
+        "garbled audio", avg_logprob=-1.5, no_speech_prob=0.05, compression_ratio=1.0
+    )
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[low_conf],
+    )
+    _run_v2_pipeline(mock_asr, mock_classifier, mock_llm, mock_tts)
+
+    # Classifier must NOT be called for low-confidence utterances
+    mock_classifier.classify.assert_not_called()
+    mock_llm.respond_stream.assert_not_called()
+
+
+def test_deafness_probe_fires_after_threshold_drops():
+    """TTS probe fires exactly once after 3 low-confidence drops; 4th does not re-fire."""
+    low_conf = _make_utterance(
+        "garbled", avg_logprob=-1.5, no_speech_prob=0.05, compression_ratio=1.0
+    )
+    # 4 consecutive low-confidence utterances
+    utterances = [low_conf, low_conf, low_conf, low_conf]
+
+    mock_asr = MagicMock()
+    mock_asr.transcribe_stream.return_value = iter(utterances)
+    mock_classifier = MagicMock()
+    mock_llm = MagicMock()
+    mock_tts = MagicMock()
+    probe_audio = np.zeros(24_000, dtype=np.float32)
+    mock_tts.stream_synthesize.return_value = iter([probe_audio])
+
+    with (
+        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+        patch("meeting_agent.audio.play"),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
     ):
         Pipeline(PipelineConfig()).run()
 
-    # LLM and TTS must not be called when there was no utterance.
+    # stream_synthesize called exactly once (for the probe) with the probe text
+    mock_tts.stream_synthesize.assert_called_once()
+    args = mock_tts.stream_synthesize.call_args[0][0]
+    assert "losing" in args or "dropping" in args  # probe text keywords
+
+
+# ---------------------------------------------------------------------------
+# V2 pipeline: staleness gate
+# ---------------------------------------------------------------------------
+
+
+def test_staleness_gate_downgrades_above_1_5s():
+    """full_answer decision is downgraded to hedged_answer when utterance is 2s old."""
+    utterance = _make_utterance("What is the plan?")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_full_answer_decision(speaker="Jason")],
+        lm_deltas=["Here is the plan."],
+    )
+
+    # Simulate: arrival at t=0, staleness check at t=2.1 (age > 1.5s)
+    # Call sequence:
+    #   1. utterance_arrival_monotonic = time.monotonic()  → 0.0
+    #   2. airtime.count_last(300) → time.monotonic()     → 0.0
+    #   3. airtime.count_last(30) → time.monotonic()      → 0.0
+    #   4. staleness check: time.monotonic()               → 2.1
+    #   rest: any large value
+    call_idx = [0]
+    times_seq = [0.0, 0.0, 0.0, 2.1]
+
+    def fake_mono() -> float:
+        idx = call_idx[0]
+        call_idx[0] += 1
+        if idx < len(times_seq):
+            return times_seq[idx]
+        return 2.1
+
+    with (
+        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+        patch("meeting_agent.audio.play"),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
+        patch("meeting_agent.pipeline.time.monotonic", side_effect=fake_mono),
+    ):
+        Pipeline(PipelineConfig()).run()
+
+    # Response should still be called (just downgraded, not dropped)
+    mock_llm.respond_stream.assert_called_once()
+
+
+def test_staleness_gate_drops_above_5s():
+    """Utterance older than 5s is dropped; LLM is not called."""
+    utterance = _make_utterance("What is the plan?")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_full_answer_decision(speaker="Jason")],
+    )
+
+    # Simulate: arrival at t=0, staleness check at t=6.0 (age > 5s → drop)
+    call_idx = [0]
+    times_seq = [0.0, 0.0, 0.0, 6.0]
+
+    def fake_mono() -> float:
+        idx = call_idx[0]
+        call_idx[0] += 1
+        if idx < len(times_seq):
+            return times_seq[idx]
+        return 6.0
+
+    with (
+        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+        patch("meeting_agent.audio.play"),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
+        patch("meeting_agent.pipeline.time.monotonic", side_effect=fake_mono),
+    ):
+        Pipeline(PipelineConfig()).run()
+
     mock_llm.respond_stream.assert_not_called()
-    mock_tts.stream_synthesize.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# V2 pipeline: circuit breaker
+# ---------------------------------------------------------------------------
+
+
+def test_circuit_breaker_opens_after_3_failures():
+    """After 3 respond_stream failures within 10s, 4th utterance's response is skipped."""
+    utterances = [_make_utterance(f"Question {i}") for i in range(4)]
+    decisions = [_full_answer_decision() for _ in range(4)]
+
+    mock_asr = MagicMock()
+    mock_asr.transcribe_stream.return_value = iter(utterances)
+
+    mock_classifier = MagicMock()
+    mock_classifier.classify.side_effect = decisions
+
+    mock_llm = MagicMock()
+    # First 3 calls raise; 4th would succeed but shouldn't be reached
+    mock_llm.respond_stream.side_effect = [
+        RuntimeError("bedrock error"),
+        RuntimeError("bedrock error"),
+        RuntimeError("bedrock error"),
+        iter(["Fourth reply."]),
+    ]
+
+    mock_tts = MagicMock()
+    mock_tts.stream_synthesize.return_value = iter([_FAKE_AUDIO_CHUNK])
+
+    with (
+        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+        patch("meeting_agent.audio.play"),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
+    ):
+        Pipeline(PipelineConfig()).run()
+
+    # LLM was called 3 times (all failed); 4th was skipped by open circuit
+    assert mock_llm.respond_stream.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# V2 pipeline: airtime tracking
+# ---------------------------------------------------------------------------
+
+
+def test_airtime_count_passed_to_classifier():
+    """After one agent turn, next classifier call has agent_turns_last_30s == 1."""
+    utterances = [
+        _make_utterance("First question"),
+        _make_utterance("Second question"),
+    ]
+    decisions = [
+        _full_answer_decision(speaker="Jason"),
+        _full_answer_decision(speaker="Jason"),
+    ]
+
+    mock_asr = MagicMock()
+    # Need to return a fresh iterator that supports two utterances and then stops
+    mock_asr.transcribe_stream.return_value = iter(utterances)
+
+    mock_classifier = MagicMock()
+    mock_classifier.classify.side_effect = decisions
+
+    respond_call_count = [0]
+
+    def _lm_gen(ctx, conv):  # type: ignore[no-untyped-def]
+        respond_call_count[0] += 1
+        yield "Reply."
+
+    mock_llm = MagicMock()
+    mock_llm.respond_stream.side_effect = _lm_gen
+
+    mock_tts = MagicMock()
+    mock_tts.stream_synthesize.return_value = iter([_FAKE_AUDIO_CHUNK])
+
+    with (
+        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+        patch("meeting_agent.audio.play"),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
+    ):
+        Pipeline(PipelineConfig()).run()
+
+    assert mock_classifier.classify.call_count == 2
+    # On the second call, session should have agent_turns_last_30s == 1
+    second_call_args = mock_classifier.classify.call_args_list[1]
+    session = second_call_args[0][3]  # positional arg 3 = session
+    assert session.agent_turns_last_30s == 1
+
+
+# ---------------------------------------------------------------------------
+# V2 pipeline: multi-speaker transcript
+# ---------------------------------------------------------------------------
+
+
+def test_multi_speaker_transcript_appended():
+    """Classifier-attributed speaker names appear correctly in older_turns."""
+    utterances = [
+        _make_utterance("Question from Jason"),
+        _make_utterance("Question from Aziz"),
+        _make_utterance("Jason asks again"),
+    ]
+    decisions = [
+        Decision(speaker="Jason", action="silent", confidence=0.9),
+        Decision(speaker="Aziz", action="silent", confidence=0.9),
+        Decision(speaker="Jason", action="full_answer", confidence=0.9),
+    ]
+
+    mock_asr = MagicMock()
+    mock_asr.transcribe_stream.return_value = iter(utterances)
+
+    mock_classifier = MagicMock()
+    mock_classifier.classify.side_effect = decisions
+
+    captured_older_turns: list[list[Turn]] = []
+
+    def _lm_gen(ctx, conv):  # type: ignore[no-untyped-def]
+        captured_older_turns.append(list(conv.older_turns))
+        yield "Agent answer."
+
+    mock_llm = MagicMock()
+    mock_llm.respond_stream.side_effect = _lm_gen
+
+    mock_tts = MagicMock()
+    mock_tts.stream_synthesize.return_value = iter([_FAKE_AUDIO_CHUNK])
+
+    with (
+        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+        patch("meeting_agent.audio.play"),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
+    ):
+        Pipeline(PipelineConfig()).run()
+
+    # At time of LLM call, older_turns should have the 2 silent turns
+    assert len(captured_older_turns) == 1
+    older = captured_older_turns[0]
+    assert len(older) == 2
+    assert older[0] == Turn(speaker="Jason", text="Question from Jason")
+    assert older[1] == Turn(speaker="Aziz", text="Question from Aziz")
+
+
+# ---------------------------------------------------------------------------
+# V2 pipeline: KeyboardInterrupt exits cleanly
+# ---------------------------------------------------------------------------
 
 
 def test_keyboard_interrupt_exits_cleanly():
     """run() returns normally (does not raise) when Ctrl-C is received."""
-    detect_count: list[int] = [0]
-
-    def immediate_interrupt(chunk: np.ndarray) -> bool:  # type: ignore[type-arg]
-        detect_count[0] += 1
-        raise KeyboardInterrupt
-
-    mock_wake = MagicMock()
-    mock_wake.detect.side_effect = immediate_interrupt
-
     mock_asr = MagicMock()
+    mock_asr.transcribe_stream.side_effect = KeyboardInterrupt
+
+    mock_classifier = MagicMock()
     mock_llm = MagicMock()
     mock_tts = MagicMock()
 
     with (
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
-        patch("meeting_agent.pipeline.WakeDetector", return_value=mock_wake),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline.Classifier", return_value=mock_classifier),
         patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
     ):
         # Must not raise
         Pipeline(PipelineConfig()).run()
 
-    assert detect_count[0] >= 1
+
+# ---------------------------------------------------------------------------
+# Coverage gap tests: helpers not exercised by pipeline integration tests
+# ---------------------------------------------------------------------------
+
+
+def test_install_exception_log_creates_logger(tmp_path, monkeypatch):
+    """_install_exception_log creates the log dir and returns a configured logger."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+
+    # Remove any pre-existing handlers to test the initialisation path.
+    exc_logger = logging.getLogger("meeting_agent.exceptions")
+    exc_logger.handlers.clear()
+
+    logger = _install_exception_log()
+
+    assert logger.name == "meeting_agent.exceptions"
+    assert logger.level == logging.INFO
+    assert len(logger.handlers) >= 1
+    assert (tmp_path / "exceptions.jsonl").parent.is_dir()
+
+
+def test_install_exception_log_no_duplicate_handlers(tmp_path, monkeypatch):
+    """_install_exception_log does not add a second handler when called twice."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+
+    exc_logger = logging.getLogger("meeting_agent.exceptions")
+    exc_logger.handlers.clear()
+
+    _install_exception_log()
+    handler_count_after_first = len(exc_logger.handlers)
+
+    # Second call must not add another handler.
+    _install_exception_log()
+    assert len(exc_logger.handlers) == handler_count_after_first
+
+
+def test_circuit_breaker_prunes_old_failures():
+    """Failures older than fail_window_s do not count toward the threshold."""
+    cb = CircuitBreaker(fail_threshold=2, fail_window_s=1.0, open_s=15.0)
+
+    with patch("meeting_agent.pipeline.time.monotonic") as mock_time:
+        # First failure at t=0
+        mock_time.return_value = 0.0
+        try:
+            with cb:
+                raise RuntimeError("old failure")
+        except RuntimeError:
+            pass
+
+        # Second failure at t=2.0 — beyond the 1.0s window; old failure is pruned
+        mock_time.return_value = 2.0
+        try:
+            with cb:
+                raise RuntimeError("recent failure")
+        except RuntimeError:
+            pass
+
+    # Only 1 failure within the window (fail_threshold=2) → circuit stays closed
+    with cb:
+        pass  # must not raise CircuitBreakerOpen
+
+
+def test_deafness_probe_prunes_old_drops():
+    """Drops older than window_s are pruned and don't count toward threshold."""
+    dp = DeafnessProbe(threshold=2, window_s=1.0)
+
+    with patch("meeting_agent.pipeline.time.monotonic") as mock_time:
+        mock_time.return_value = 0.0
+        dp.record_drop()
+
+        # Advance time past the window; the old drop is pruned on next record_drop
+        mock_time.return_value = 2.0
+        dp.record_drop()
+
+    # Only 1 drop is within the window → should not probe
+    assert len(dp._drops) == 1
+    assert not dp.should_probe()
+
+
+def test_unpunctuated_lm_response_still_synthesised():
+    """LLM output without terminal punctuation is synthesised via the tail flush path."""
+    utterance = _make_utterance("Tell me something")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_full_answer_decision(speaker="Jason")],
+        lm_deltas=["Sure thing"],  # no terminal punctuation → tail flush path
+    )
+    _run_v2_pipeline(mock_asr, mock_classifier, mock_llm, mock_tts)
+
+    mock_tts.stream_synthesize.assert_called_once_with("Sure thing")

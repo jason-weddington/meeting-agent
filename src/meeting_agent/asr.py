@@ -47,11 +47,14 @@ _WHISPER_HALLUCINATIONS: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class Utterance:
-    """A single transcribed utterance with wall-clock timing."""
+    """A single transcribed utterance with wall-clock timing and ASR confidence."""
 
     text: str
     start_s: float
     end_s: float
+    avg_logprob: float = 0.0  # mean of segment avg_logprobs; 0.0 default for compat
+    no_speech_prob: float = 0.0  # max of segment no_speech_probs
+    compression_ratio: float = 0.0  # mean of segment compression_ratios
 
 
 class StreamingASR:
@@ -162,10 +165,27 @@ class StreamingASR:
                             normalized = transcript.strip().lower().rstrip(".!?")
                             if normalized not in _WHISPER_HALLUCINATIONS:
                                 end_s: float = elapsed_s + chunk_s
+                                # Compute confidence aggregates from segments.
+                                segs: list[dict[str, float]] = result.get("segments", [])
+                                if segs:
+                                    avg_logprob = sum(
+                                        s.get("avg_logprob", 0.0) for s in segs
+                                    ) / len(segs)
+                                    no_speech_prob = max(s.get("no_speech_prob", 0.0) for s in segs)
+                                    compression_ratio = sum(
+                                        s.get("compression_ratio", 0.0) for s in segs
+                                    ) / len(segs)
+                                else:
+                                    avg_logprob = 0.0
+                                    no_speech_prob = 0.0
+                                    compression_ratio = 0.0
                                 yield Utterance(
                                     text=transcript,
                                     start_s=start_s,
                                     end_s=end_s,
+                                    avg_logprob=avg_logprob,
+                                    no_speech_prob=no_speech_prob,
+                                    compression_ratio=compression_ratio,
                                 )
                         buffer = []
                         in_speech = False

@@ -49,12 +49,57 @@ class Conversation:
     """Rolling transcript for one meeting.
 
     ``older_turns`` holds completed exchanges; ``latest_turn`` is the current
-    user utterance. The Bedrock Converse API sees these as native multi-turn
-    messages — not flat text with speaker labels.
+    utterance triggering this response. The Bedrock Converse API sees these as
+    native multi-turn messages — not flat text with speaker labels.
+
+    In V2, speaker names are real participant names (e.g. "Jason", "Aziz")
+    rather than the generic "user" used in V1. Consecutive non-agent turns are
+    collapsed into a single Bedrock user message with speaker prefixes to
+    satisfy the alternation constraint.
     """
 
     older_turns: list[Turn] = field(default_factory=list)
     latest_turn: Turn | None = None
+
+
+def _build_messages(conversation: Conversation) -> list[dict[str, Any]]:
+    """Build a Bedrock-compatible messages list from the conversation.
+
+    Collapses consecutive non-agent turns into a single user message using
+    ``speaker: text`` prefixes, satisfying Bedrock's strict user/assistant
+    alternation requirement.
+
+    Args:
+        conversation: The current conversation state. ``latest_turn`` must
+            already be set (caller is responsible).
+
+    Returns:
+        List of ``{"role": ..., "content": [...]}`` dicts ready for the
+        Bedrock Converse API.
+    """
+    # Caller (respond_stream) validates latest_turn is not None before calling.
+    if conversation.latest_turn is None:  # pragma: no cover
+        raise ValueError("latest_turn must be set before calling _build_messages")
+
+    messages: list[dict[str, Any]] = []
+    buffer: list[str] = []
+
+    def flush_user() -> None:
+        if buffer:
+            messages.append({"role": "user", "content": [{"text": "\n".join(buffer)}]})
+            buffer.clear()
+
+    for turn in conversation.older_turns:
+        if turn.speaker == "agent":
+            flush_user()
+            messages.append({"role": "assistant", "content": [{"text": turn.text}]})
+        else:
+            buffer.append(f"{turn.speaker}: {turn.text}")
+
+    # Append the triggering utterance to the trailing user block.
+    buffer.append(f"{conversation.latest_turn.speaker}: {conversation.latest_turn.text}")
+    flush_user()
+    return messages
 
 
 class BedrockClient:
@@ -91,20 +136,28 @@ class BedrockClient:
     ) -> Iterator[str]:
         """Yield text deltas from Claude's streamed response.
 
+        V2 speaker rules:
+        - ``latest_turn`` must be set and must not have ``speaker == "agent"``.
+          Any other speaker name is valid (real participant names).
+        - ``older_turns`` can contain any speaker name. ``"agent"`` maps to
+          ``role: "assistant"``; any other name maps to ``role: "user"`` (with
+          speaker prefix). Consecutive non-agent turns are collapsed into a
+          single user message.
+
         Callers should split deltas on sentence boundaries (``.``, ``?``,
         ``!``) before feeding them to ``tts.TTS.stream_synthesize`` for
         low-latency playback.
 
         Raises:
             ValueError: If ``conversation.latest_turn`` is ``None``.
-            ValueError: If ``conversation.latest_turn.speaker`` is not ``"user"``.
-            ValueError: If any turn in ``conversation.older_turns`` has an unknown speaker.
+            ValueError: If ``conversation.latest_turn.speaker`` is ``"agent"``.
         """
         if conversation.latest_turn is None:
             raise ValueError("Conversation.latest_turn must be set")
-        if conversation.latest_turn.speaker != "user":
+        if conversation.latest_turn.speaker == "agent":
             raise ValueError(
-                f"latest_turn must be from 'user' speaker, got {conversation.latest_turn.speaker!r}"
+                "latest_turn must not be from the 'agent' speaker; "
+                f"got {conversation.latest_turn.speaker!r}"
             )
 
         system_text = "\n\n".join(
@@ -120,24 +173,7 @@ class BedrockClient:
             )
         )
 
-        messages: list[dict[str, Any]] = []
-        for turn in conversation.older_turns:
-            if turn.speaker == "user":
-                role = "user"
-            elif turn.speaker == "agent":
-                role = "assistant"
-            else:
-                raise ValueError(
-                    f"Unknown speaker {turn.speaker!r} in older_turns; expected 'user' or 'agent'"
-                )
-            messages.append({"role": role, "content": [{"text": turn.text}]})
-
-        messages.append(
-            {
-                "role": "user",
-                "content": [{"text": conversation.latest_turn.text}],
-            }
-        )
+        messages = _build_messages(conversation)
 
         request = {
             "modelId": self.model_id,

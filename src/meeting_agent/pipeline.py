@@ -1,32 +1,226 @@
 """End-to-end meeting-agent pipeline orchestrator.
 
-Wires audio capture → wake detection → streaming ASR → Bedrock Claude →
-sentence-pipelined TTS → audio playback. Maintains the rolling transcript and
-gates the mic while the agent is speaking to avoid feedback.
+Wires audio capture → always-on streaming ASR → Bedrock Haiku classifier →
+Bedrock Claude response LLM → sentence-pipelined TTS → audio playback.
+Maintains the rolling transcript; gates the mic while the agent is speaking
+to avoid feedback.
+
+V2 flow (always-on, classifier-gated):
+  1. Open mic stream.
+  2. Feed every chunk to StreamingASR (VAD-gated Whisper).
+  3. For each utterance, run the pre-classifier confidence gate.
+  4. Pass surviving utterances through the Haiku classifier.
+  5. If classifier says "silent", append to transcript and continue.
+  6. If "hedged_answer" or "full_answer" (and not stale), respond via Bedrock
+     Claude + TTS, then drain mic echo.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import logging.handlers
+import os
 import queue
 import re
 import threading
 import time
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 from meeting_agent import audio
 from meeting_agent.asr import StreamingASR, Utterance
 from meeting_agent.audio import AudioArray
+from meeting_agent.classifier import Classifier, Confidence, SessionState
 from meeting_agent.llm import BedrockClient, Conversation, ProjectContext, Turn
 from meeting_agent.tts import SAMPLE_RATE as TTS_SAMPLE_RATE
 from meeting_agent.tts import TTS
-from meeting_agent.wake import WakeDetector
 
 _metrics = logging.getLogger("meeting_agent.metrics")
 
 _CHUNK_MS = 100
 _ECHO_TAIL_S = 0.5  # extra drain time past playback to flush speaker echo
+
+# Staleness thresholds: age > DROP_S → discard entirely; age in (HEDGE_S, DROP_S]
+# and action == "full_answer" → downgrade to "hedged_answer".
+_STALE_DROP_S = 5.0
+_STALE_HEDGE_S = 1.5
+
+
+# ---------------------------------------------------------------------------
+# CircuitBreaker
+# ---------------------------------------------------------------------------
+
+
+class CircuitBreakerOpen(Exception):
+    """Raised by :class:`CircuitBreaker.__enter__` when the circuit is open."""
+
+
+class CircuitBreaker:
+    """Hand-rolled circuit breaker for the Bedrock Sonnet + TTS path.
+
+    Opens after ``fail_threshold`` failures within ``fail_window_s`` seconds.
+    Stays open for ``open_s`` seconds, then goes half-open (one probe allowed).
+    """
+
+    def __init__(
+        self,
+        fail_threshold: int = 3,
+        fail_window_s: float = 10.0,
+        open_s: float = 15.0,
+    ) -> None:
+        """Initialise closed circuit."""
+        self._failures: deque[float] = deque()
+        self._opened_at: float | None = None
+        self._fail_threshold = fail_threshold
+        self._fail_window_s = fail_window_s
+        self._open_s = open_s
+
+    def __enter__(self) -> CircuitBreaker:
+        """Check if circuit is open; raise :class:`CircuitBreakerOpen` if so."""
+        if self._opened_at is not None:
+            if time.monotonic() - self._opened_at < self._open_s:
+                raise CircuitBreakerOpen()
+            self._opened_at = None  # half-open probe
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: Any,
+    ) -> None:
+        """Record any exception as a failure; open circuit if threshold reached."""
+        if exc is not None:
+            now = time.monotonic()
+            self._failures.append(now)
+            # Prune failures outside the window.
+            while self._failures and self._failures[0] < now - self._fail_window_s:
+                self._failures.popleft()
+            if len(self._failures) >= self._fail_threshold:
+                self._opened_at = now
+
+
+# ---------------------------------------------------------------------------
+# AirtimeTracker
+# ---------------------------------------------------------------------------
+
+
+class AirtimeTracker:
+    """Rolling count of agent emission events for airtime budgeting."""
+
+    def __init__(self) -> None:
+        """Initialise empty emission log."""
+        self._emissions: deque[float] = deque()
+
+    def record_emission(self, t: float) -> None:
+        """Record a new emission at monotonic timestamp ``t``."""
+        self._emissions.append(t)
+        cutoff = t - 300.0  # keep at most last 5 minutes
+        while self._emissions and self._emissions[0] < cutoff:
+            self._emissions.popleft()
+
+    def count_last(self, window_s: float) -> int:
+        """Return the number of emissions in the last ``window_s`` seconds."""
+        now = time.monotonic()
+        return sum(1 for t in self._emissions if t > now - window_s)
+
+
+# ---------------------------------------------------------------------------
+# DeafnessProbe
+# ---------------------------------------------------------------------------
+
+
+class DeafnessProbe:
+    """One-shot deafness probe: speaks if too many utterances drop on confidence.
+
+    After ``threshold`` low-confidence drops within ``window_s``, emits a
+    single verbal acknowledgement that audio quality is degraded. Fires at
+    most once per ``Pipeline.run()`` invocation.
+    """
+
+    PROBE_TEXT = (
+        "I think I'm losing some audio on my end — I might be dropping parts of what you're saying."
+    )
+
+    def __init__(self, threshold: int = 3, window_s: float = 30.0) -> None:
+        """Initialise with zero recorded drops."""
+        self._drops: deque[float] = deque()
+        self._used = False
+        self._threshold = threshold
+        self._window_s = window_s
+
+    def record_drop(self) -> None:
+        """Record a confidence-gate drop at the current time."""
+        now = time.monotonic()
+        self._drops.append(now)
+        while self._drops and self._drops[0] < now - self._window_s:
+            self._drops.popleft()
+
+    def should_probe(self) -> bool:
+        """Return True if threshold drops reached and probe has not fired yet."""
+        return not self._used and len(self._drops) >= self._threshold
+
+    def mark_used(self) -> None:
+        """Mark the probe as fired; subsequent ``should_probe()`` calls return False."""
+        self._used = True
+
+
+# ---------------------------------------------------------------------------
+# Pre-classifier confidence gate
+# ---------------------------------------------------------------------------
+
+
+def _is_low_confidence(u: Utterance) -> bool:
+    """Return True when ASR confidence is too low to classify reliably.
+
+    Thresholds:
+    - ``avg_logprob < -1.0``: Whisper assigned low probability to the tokens.
+    - ``no_speech_prob > 0.6``: segment is more likely silence/noise than speech.
+    - ``compression_ratio > 2.4``: token sequence is suspiciously repetitive (hallucination signal).
+    """
+    return u.avg_logprob < -1.0 or u.no_speech_prob > 0.6 or u.compression_ratio > 2.4
+
+
+# ---------------------------------------------------------------------------
+# Exception log installer
+# ---------------------------------------------------------------------------
+
+
+def _install_exception_log() -> logging.Logger:
+    """Create and configure the JSONL exception log for post-hoc debugging.
+
+    Writes to ``$XDG_STATE_HOME/meeting-agent/exceptions.jsonl`` (or
+    ``~/.meeting-agent/exceptions.jsonl`` if the env var is unset).
+    Uses a rotating handler capped at 1 MB × 3 backups.
+
+    Returns:
+        The configured ``meeting_agent.exceptions`` logger.
+    """
+    log_dir = Path(os.environ.get("XDG_STATE_HOME", "~/.meeting-agent")).expanduser()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        log_dir / "exceptions.jsonl",
+        maxBytes=1_000_000,
+        backupCount=3,
+    )
+    handler.setFormatter(
+        logging.Formatter('{"ts": "%(asctime)s", "level": "%(levelname)s", "msg": %(message)s}')
+    )
+    logger = logging.getLogger("meeting_agent.exceptions")
+    # Avoid adding duplicate handlers on repeated calls (e.g. in tests).
+    if not logger.handlers:
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    return logger
+
+
+# ---------------------------------------------------------------------------
+# PipelineConfig
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -35,23 +229,25 @@ class PipelineConfig:
 
     input_device: int | None = None
     output_device: int | None = None
-    wake_phrase: str = "hey_jarvis"
     model_id: str = "us.anthropic.claude-sonnet-4-6"
+    classifier_model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
     asr_initial_prompt: str | None = None
     context: ProjectContext = field(default_factory=lambda: ProjectContext(system_prompt=""))
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
 
 
 class Pipeline:
     """Main event loop for a meeting session.
 
-    Lifecycle:
+    Lifecycle (V2 always-on):
       1. Open mic stream.
-      2. Feed every chunk to wake-word detector.
-      3. On wake, start streaming ASR from the mic until VAD end-of-speech.
-      4. Send the transcribed turn + rolling context to Bedrock Claude.
-      5. Pipeline Claude's streamed sentences into Kokoro TTS.
-      6. Play synthesized sentences while gating the mic.
-      7. Append the exchange to the rolling transcript; return to step 2.
+      2. Feed all chunks to StreamingASR (VAD-gated Whisper).
+      3. For each utterance: confidence gate → classify → (silent | respond).
+      4. After responding: drain mic echo, update rolling transcript.
     """
 
     def __init__(self, config: PipelineConfig) -> None:
@@ -63,50 +259,134 @@ class Pipeline:
         config = self.config
 
         # Build components — model loads happen here.
-        chunks_iter = audio.record_chunks(device=config.input_device, chunk_ms=100)
-        wake = WakeDetector(config.wake_phrase)
+        chunks_iter = audio.record_chunks(device=config.input_device, chunk_ms=_CHUNK_MS)
         asr = StreamingASR(initial_prompt=config.asr_initial_prompt)
         tts = TTS()
         llm = BedrockClient(model_id=config.model_id)
+        classifier = Classifier(model_id=config.classifier_model_id)
 
         # Rolling transcript initialised empty.
         conversation = Conversation(older_turns=[], latest_turn=None)
 
-        try:
-            while True:
-                # Stage 1: wait for wake-word (mic is active; chunks consumed here).
-                t_wake = self._wait_for_wake(chunks_iter, wake)
+        # Robustness scaffolding.
+        airtime = AirtimeTracker()
+        circuit_breaker = CircuitBreaker()
+        probe = DeafnessProbe()
+        exc_log = _install_exception_log()
 
-                # Stage 2: transcribe the user's utterance.
-                utterance = self._collect_utterance(chunks_iter, asr)
-                if utterance is None:
-                    # False wake / timeout — no real speech detected.
-                    print("No speech detected; listening again.", flush=True)
+        try:
+            for utterance in asr.transcribe_stream(chunks_iter):
+                utterance_arrival_monotonic = time.monotonic()
+
+                # ------------------------------------------------------------------
+                # Pre-classifier confidence gate
+                # ------------------------------------------------------------------
+                if _is_low_confidence(utterance):
+                    probe.record_drop()
+                    if probe.should_probe():
+                        for chunk in tts.stream_synthesize(DeafnessProbe.PROBE_TEXT):
+                            audio.play(
+                                chunk,
+                                sample_rate=TTS_SAMPLE_RATE,
+                                device=config.output_device,
+                            )
+                        probe.mark_used()
+                    exc_log.info(
+                        json.dumps(
+                            {
+                                "event": "low_confidence_drop",
+                                "text": utterance.text[:80],
+                                "avg_logprob": utterance.avg_logprob,
+                                "no_speech_prob": utterance.no_speech_prob,
+                                "compression_ratio": utterance.compression_ratio,
+                            }
+                        )
+                    )
                     continue
 
-                t_asr_done = time.monotonic()
-                _metrics.info("asr_latency_s=%.3f", t_asr_done - t_wake)
+                # ------------------------------------------------------------------
+                # Classify
+                # ------------------------------------------------------------------
+                session = SessionState(
+                    recent_turns=tuple(conversation.older_turns[-5:]),
+                    agent_turns_last_5min=airtime.count_last(300),
+                    agent_turns_last_30s=airtime.count_last(30),
+                )
+                confidence = Confidence(
+                    avg_logprob=utterance.avg_logprob,
+                    no_speech_prob=utterance.no_speech_prob,
+                    compression_ratio=utterance.compression_ratio,
+                )
+                decision = classifier.classify(utterance, confidence, config.context, session)
 
-                # Update conversation with the new user turn.
-                conversation.latest_turn = Turn(speaker="user", text=utterance.text)
+                # ------------------------------------------------------------------
+                # Silent? Append turn and continue listening.
+                # ------------------------------------------------------------------
+                if decision.action == "silent":
+                    conversation.older_turns.append(
+                        Turn(speaker=decision.speaker, text=utterance.text)
+                    )
+                    continue
 
-                # Stage 3: stream LLM response, pipeline TTS, play audio.
-                # Mic is implicitly gated here: chunks_iter is not read while
-                # _stream_and_play is executing, so wake detection is suspended.
-                t_speak_start = time.monotonic()
-                full_response = self._stream_and_play(config, conversation, llm, tts, t_asr_done)
-                speak_duration = time.monotonic() - t_speak_start
+                # ------------------------------------------------------------------
+                # Staleness gate
+                # ------------------------------------------------------------------
+                age = time.monotonic() - utterance_arrival_monotonic
+                if age > _STALE_DROP_S:
+                    exc_log.info(
+                        json.dumps(
+                            {
+                                "event": "stale_drop_5s",
+                                "age_s": round(age, 3),
+                                "text": utterance.text[:80],
+                            }
+                        )
+                    )
+                    continue
+                action = decision.action
+                if age > _STALE_HEDGE_S and action == "full_answer":
+                    action = "hedged_answer"  # downgrade
 
-                # Stage 4: flush the mic-queue backlog of the agent's own voice
-                # before returning to wake-word listening. Without this, the
-                # next _wait_for_wake call processes buffered echo and triggers
-                # on the agent's previous response — a feedback loop.
-                self._drain_echo(chunks_iter, speak_duration + _ECHO_TAIL_S)
+                # ------------------------------------------------------------------
+                # Respond (Bedrock Sonnet + TTS, circuit-breaker guarded)
+                # ------------------------------------------------------------------
+                conversation.latest_turn = Turn(speaker=decision.speaker, text=utterance.text)
+                try:
+                    with circuit_breaker:
+                        t_speak_start = time.monotonic()
+                        full_response = self._stream_and_play(
+                            config, conversation, llm, tts, utterance_arrival_monotonic
+                        )
+                        speak_duration = time.monotonic() - t_speak_start
+                except CircuitBreakerOpen:
+                    exc_log.info(json.dumps({"event": "circuit_open"}))
+                    conversation.latest_turn = None
+                    continue
+                except Exception as exc:
+                    exc_log.warning(
+                        json.dumps(
+                            {
+                                "event": "bedrock_timeout",
+                                "error": str(exc),
+                            }
+                        )
+                    )
+                    conversation.latest_turn = None
+                    continue
 
-                # Commit the completed exchange to the rolling transcript.
-                conversation.older_turns.append(Turn(speaker="user", text=utterance.text))
+                # ------------------------------------------------------------------
+                # Commit exchange to rolling transcript
+                # ------------------------------------------------------------------
+                conversation.older_turns.append(Turn(speaker=decision.speaker, text=utterance.text))
                 conversation.older_turns.append(Turn(speaker="agent", text=full_response))
                 conversation.latest_turn = None
+                airtime.record_emission(time.monotonic())
+
+                # ------------------------------------------------------------------
+                # Drain echo — discard backlogged mic audio captured while
+                # the agent was speaking to prevent feedback on next utterance.
+                # ------------------------------------------------------------------
+                self._drain_echo(chunks_iter, speak_duration + _ECHO_TAIL_S)
 
         except KeyboardInterrupt:
             pass
@@ -115,72 +395,14 @@ class Pipeline:
     # Named pipeline stages — kept separate for testability.
     # ------------------------------------------------------------------
 
-    def _wait_for_wake(
-        self,
-        chunks_iter: Iterator[AudioArray],
-        wake: WakeDetector,
-    ) -> float:
-        """Block until a wake-word trigger is detected.
-
-        Args:
-            chunks_iter: Continuous 16 kHz audio chunk iterator.
-            wake: Configured wake-word detector.
-
-        Returns:
-            Monotonic timestamp of the wake detection event.
-        """
-        print(f"Listening for wake phrase ({self.config.wake_phrase!r})...", flush=True)
-        for chunk in chunks_iter:
-            if wake.detect(chunk):
-                print("Wake detected. Listening for your question...", flush=True)
-                return time.monotonic()
-        return time.monotonic()  # iterator exhausted (edge case / tests)
-
-    def _collect_utterance(
-        self,
-        chunks_iter: Iterator[AudioArray],
-        asr: StreamingASR,
-        timeout_s: float = 15.0,
-    ) -> Utterance | None:
-        """Feed audio chunks to ASR and return the first completed utterance.
-
-        Feeds chunks to the ASR for at most ``timeout_s`` seconds. If no
-        utterance completes within that window (e.g. a false wake trigger with
-        no real speech following), returns ``None`` so the caller can loop back
-        to wake-word listening without blocking indefinitely.
-
-        Args:
-            chunks_iter: Same continuous chunk iterator used by
-                :meth:`_wait_for_wake`; ASR consumes subsequent chunks.
-            asr: Streaming ASR instance with Silero VAD endpointing.
-            timeout_s: Maximum seconds to wait for an utterance before giving
-                up and returning ``None``.
-
-        Returns:
-            The first :class:`~meeting_agent.asr.Utterance` produced, or
-            ``None`` if the timeout expires before any utterance completes.
-        """
-        deadline = time.monotonic() + timeout_s
-
-        def _bounded_chunks() -> Iterator[AudioArray]:
-            for chunk in chunks_iter:
-                if time.monotonic() > deadline:
-                    return
-                yield chunk
-
-        for utterance in asr.transcribe_stream(_bounded_chunks()):
-            return utterance
-        return None  # iterator exhausted (timeout) before any utterance
-
     def _drain_echo(self, chunks_iter: Iterator[AudioArray], duration_s: float) -> None:
         """Discard ``duration_s`` seconds of chunks from the iterator.
 
         The mic-capture queue inside :func:`audio.record_chunks` keeps filling
         while the agent speaks (the callback runs regardless of consumption).
         After agent playback ends, that backlog is full of the agent's own
-        audio captured via the speakers. Reading it into the wake detector
-        produces a feedback loop: the agent hears itself, triggers wake, and
-        transcribes its prior response as the user's turn.
+        audio captured via the speakers. Reading it into the ASR pipeline
+        would produce a feedback loop.
 
         This drains the backlog plus a small tail to cover residual echo.
         Assumes 100 ms chunks (as configured in :meth:`run`). The backlog
@@ -204,16 +426,16 @@ class Pipeline:
         into a worker thread that handles TTS synthesis and speaker playback in
         parallel with the LLM continuing to stream subsequent sentences.
 
-        The mic is implicitly gated during this method: :meth:`_wait_for_wake`
-        is not invoked, so wake-word detection is suspended for the duration of
-        agent speech.
+        The mic is implicitly gated during this method: the main loop is blocked
+        inside this call, so ASR chunk consumption is suspended for the duration
+        of agent speech.
 
         Latency events logged to ``meeting_agent.metrics``:
 
         * ``bedrock_ttft_s`` — time from end-of-utterance to first LLM delta.
         * ``tts_pipeline_overhead_s`` — time from first LLM delta to first
           TTS audio chunk.
-        * ``total_turn_latency_s`` — wake-to-first-speaker-audio latency.
+        * ``total_turn_latency_s`` — utterance-to-first-speaker-audio latency.
 
         Args:
             config: Pipeline config (output device, project context, model id).

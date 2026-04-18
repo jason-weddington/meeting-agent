@@ -493,6 +493,64 @@ def test_vad_threshold_constant_exists() -> None:
 
 
 # ---------------------------------------------------------------------------
+# V2.3: Confidence fields aggregated from mlx_whisper segments
+# ---------------------------------------------------------------------------
+
+
+@patch("silero_vad.load_silero_vad")
+@patch("mlx_whisper.transcribe")
+def test_utterance_confidence_fields_from_segments(
+    mock_transcribe: MagicMock,
+    mock_load_vad: MagicMock,
+) -> None:
+    """avg_logprob / no_speech_prob / compression_ratio aggregated from segments."""
+    probs = _vad_probs(0, 10, 5)
+    mock_vad = MagicMock(side_effect=probs)
+    mock_load_vad.return_value = mock_vad
+    mock_transcribe.return_value = {
+        "text": "hello world",
+        "segments": [
+            {"avg_logprob": -0.4, "no_speech_prob": 0.02, "compression_ratio": 1.1},
+            {"avg_logprob": -0.6, "no_speech_prob": 0.08, "compression_ratio": 1.3},
+        ],
+    }
+
+    asr = StreamingASR()
+    results = list(asr.transcribe_stream(_make_chunk_iter(0, 10, 5)))
+
+    assert len(results) == 1
+    u = results[0]
+    # avg_logprob: mean of (-0.4, -0.6) = -0.5
+    assert u.avg_logprob == pytest.approx(-0.5)
+    # no_speech_prob: max of (0.02, 0.08) = 0.08
+    assert u.no_speech_prob == pytest.approx(0.08)
+    # compression_ratio: mean of (1.1, 1.3) = 1.2
+    assert u.compression_ratio == pytest.approx(1.2)
+
+
+@patch("silero_vad.load_silero_vad")
+@patch("mlx_whisper.transcribe")
+def test_utterance_confidence_fields_default_when_no_segments(
+    mock_transcribe: MagicMock,
+    mock_load_vad: MagicMock,
+) -> None:
+    """Confidence fields default to 0.0 when transcribe result has no 'segments' key."""
+    probs = _vad_probs(0, 10, 5)
+    mock_vad = MagicMock(side_effect=probs)
+    mock_load_vad.return_value = mock_vad
+    mock_transcribe.return_value = {"text": "hello world"}  # no segments key
+
+    asr = StreamingASR()
+    results = list(asr.transcribe_stream(_make_chunk_iter(0, 10, 5)))
+
+    assert len(results) == 1
+    u = results[0]
+    assert u.avg_logprob == 0.0
+    assert u.no_speech_prob == 0.0
+    assert u.compression_ratio == 0.0
+
+
+# ---------------------------------------------------------------------------
 # Integration test (skipped unless -m integration)
 # ---------------------------------------------------------------------------
 

@@ -104,10 +104,10 @@ source = ["meeting_agent"]
 # do not lower past the measured floor.
 fail_under = 99
 
-# NOTE: Actual total coverage is 99.29% after V2.1 context loader. Three
-# uncovered lines remain: pipeline.py:137 (iterator-exhausted edge case
-# in _wait_for_wake), audio.py:90 (hardware-path branch), and
-# cli.py:172 (__name__ == "__main__" guard).
+# NOTE: Actual total coverage is 99.66% after V2.3 pipeline rewire. Two
+# uncovered lines remain: audio.py:90 (hardware-path branch) and
+# cli.py:164 (__name__ == "__main__" guard). The old pipeline.py:137
+# (wake-word iterator-exhausted edge case) was removed in V2.3.
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
