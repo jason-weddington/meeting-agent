@@ -29,7 +29,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
@@ -51,10 +51,16 @@ from meeting_agent.llm import (
     ProjectContext,
     Turn,
 )
+from meeting_agent.mcp_client import MCPClient, MCPClientError, MCPServerConfig
 from meeting_agent.trace import Tracer
 from meeting_agent.trace import install as _install_trace
 from meeting_agent.tts import SAMPLE_RATE as TTS_SAMPLE_RATE
 from meeting_agent.tts import TTS
+
+if TYPE_CHECKING:
+    from meeting_agent.mcp_client import MCPClientLike
+
+_logger = logging.getLogger(__name__)
 
 _CHUNK_MS = 100
 _ECHO_TAIL_S = 1.5  # extra drain time past playback to flush speaker echo + room reverb
@@ -290,6 +296,7 @@ class PipelineConfig:
     trace_enabled: bool = False
     trace_verbose: bool = False
     trace_log_dir: Path | None = None
+    mcp_server: MCPServerConfig | None = None  # None → no MCP KB grounding
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +425,52 @@ class Pipeline:
             on_circuit_half_open=lambda: tracer.emit("circuit_half_open_probe"),
             on_circuit_close=lambda: tracer.emit("circuit_close"),
         )
+
+        # ------------------------------------------------------------------
+        # MCP client lifecycle — opt-in via config.mcp_server
+        # ------------------------------------------------------------------
+        # _startup_client holds the MCPClient for lifecycle management (stop).
+        # mcp_client is the instance passed to the LLM layer (None if grounding
+        # is disabled or startup failed).
+        _startup_client: MCPClient | None = None
+        mcp_client: MCPClientLike | None = None
+
+        if config.mcp_server is not None:
+            _startup_client = MCPClient(config.mcp_server)
+            _t_mcp_start = time.monotonic()
+            try:
+                _startup_client.start()
+                _mcp_tools = _startup_client.list_tools()
+                _mcp_duration_s = round(time.monotonic() - _t_mcp_start, 3)
+                tracer.emit(
+                    "mcp_ready",
+                    tool_count=len(_mcp_tools),
+                    tool_names=[t.name for t in _mcp_tools],
+                    duration_s=_mcp_duration_s,
+                    ok=True,
+                )
+                if not _mcp_tools:
+                    _logger.warning(
+                        "MCP server advertises 0 tools; grounding enabled but tools unavailable."
+                    )
+                mcp_client = _startup_client
+            except MCPClientError as exc:
+                _logger.warning("MCP server unavailable (%s); running session ungrounded.", exc)
+                tracer.emit(
+                    "mcp_unavailable",
+                    error_type=type(exc).__name__,
+                    error_msg=str(exc),
+                )
+                # Attempt to clean up any partially started background thread.
+                try:
+                    _startup_client.stop()
+                except Exception:
+                    _logger.debug(
+                        "Error stopping partially-started MCP client during error cleanup.",
+                        exc_info=True,
+                    )
+                _startup_client = None
+                # mcp_client remains None
 
         try:
             for utterance in asr.transcribe_stream(chunks_iter):
@@ -562,6 +615,7 @@ class Pipeline:
                             utterance_arrival_monotonic,
                             tracer,
                             utterance.text,
+                            mcp_client=mcp_client,
                         )
                         speak_duration = time.monotonic() - t_speak_start
                 except CircuitBreakerOpen:
@@ -613,6 +667,9 @@ class Pipeline:
         except KeyboardInterrupt:
             pass
         finally:
+            if _startup_client is not None:
+                _startup_client.stop()
+                tracer.emit("mcp_stopped")
             if listener is not None:
                 listener.stop()
 
@@ -646,6 +703,7 @@ class Pipeline:
         t_asr_done: float,
         tracer: Tracer,
         utterance_text: str,
+        mcp_client: MCPClientLike | None = None,
     ) -> tuple[str, float]:
         """Stream Claude's response, pipeline TTS on sentence boundaries.
 
@@ -677,6 +735,8 @@ class Pipeline:
             t_asr_done: Monotonic timestamp when ASR finished (latency anchor).
             tracer: Trace emitter (no-op when disabled).
             utterance_text: Text of the triggering utterance (for trace records).
+            mcp_client: Optional MCP client for KB grounding.  Forwarded to
+                ``llm.respond_stream``; ``None`` disables tool-use for this turn.
 
         Returns:
             A ``(full_response, tts_audio_s)`` tuple where *full_response* is
@@ -714,7 +774,9 @@ class Pipeline:
         first_delta_logged = False
 
         try:
-            for delta in llm.respond_stream(config.context, conversation):
+            for delta in llm.respond_stream(
+                config.context, conversation, mcp_client=mcp_client, tracer=tracer
+            ):
                 if not first_delta_logged:
                     first_delta_t.append(time.monotonic())
                     first_delta_logged = True

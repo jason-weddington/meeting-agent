@@ -77,6 +77,26 @@ The Ollama backends both hit the same `ollama serve` daemon. Use `--ollama-host`
 or the `OLLAMA_HOST` env var to override the default `http://localhost:11434`
 (shared by both classifier and response-LLM paths).
 
+### KB grounding (MCP)
+
+Enable real-time KB grounding via a local stdio MCP server using `--kb-mcp`:
+
+```bash
+# Enable KB grounding via a local stdio MCP server
+uv run meeting-agent --kb-mcp "uv run personal-kb-mcp" --trace --verbose
+
+# With a path and custom argument
+uv run meeting-agent --kb-mcp "/path/to/personal-kb-mcp --some-arg"
+```
+
+`SERVER_SPEC` is parsed with `shlex.split`: first token is the command,
+remaining tokens are arguments.  No env-var passthrough yet — use a wrapper
+script if you need to inject env vars.
+
+**Note:** Ollama tool-use is not yet supported.  The `--kb-mcp` flag is silently
+ignored (with a one-time log warning) when `--llm-backend ollama` is used.
+Grounding currently only applies when the response LLM is Bedrock (the default).
+
 ## Module layout
 
 ```

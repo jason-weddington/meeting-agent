@@ -6,8 +6,11 @@ The async client runs in a dedicated background event-loop thread; callers
 interact only through the sync ``MCPClient`` API.
 
 Only stdio subprocess transports are supported.  HTTP transport is a future
-story.  Nothing in the existing pipeline imports this module — wiring happens
-in V3.0.3.
+story.
+
+``MCPClientLike`` is a structural :class:`~typing.Protocol` satisfied by both
+:class:`MCPClient` and any thin wrapper (e.g. the pipeline's failure-gate
+wrapper).  Use it as the type annotation where you accept either.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ import logging
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 import mcp.types
 from fastmcp import Client
@@ -238,3 +241,29 @@ class MCPClient:
             raise MCPClientError(f"call_tool({name!r}) failed: {exc}") from exc
         text_parts = [c.text for c in raw.content if isinstance(c, mcp.types.TextContent)]
         return ToolResult(content="\n".join(text_parts), is_error=raw.is_error)
+
+
+# ---------------------------------------------------------------------------
+# Structural protocol — satisfied by MCPClient and thin wrappers
+# ---------------------------------------------------------------------------
+
+
+class MCPClientLike(Protocol):
+    """Structural protocol for the LLM-visible subset of an MCP client.
+
+    Satisfied structurally by :class:`MCPClient` and any thin wrapper that
+    exposes the same two methods.  Use as the type annotation wherever the
+    pipeline or LLM layer accepts either.
+
+    Note: lifecycle methods (``start`` / ``stop``) are intentionally absent —
+    they are managed by the pipeline directly on the concrete :class:`MCPClient`
+    instance, not through this protocol.
+    """
+
+    def list_tools(self) -> list[ToolSpec]:
+        """Return the MCP server's advertised tools."""
+        ...
+
+    def call_tool(self, name: str, arguments: Mapping[str, Any]) -> ToolResult:
+        """Synchronously invoke one MCP tool by name."""
+        ...

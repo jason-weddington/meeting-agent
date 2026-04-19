@@ -706,7 +706,7 @@ def test_airtime_count_passed_to_classifier():
 
     respond_call_count = [0]
 
-    def _lm_gen(ctx, conv):  # type: ignore[no-untyped-def]
+    def _lm_gen(ctx, conv, **_kw):  # type: ignore[no-untyped-def]
         respond_call_count[0] += 1
         yield "Reply."
 
@@ -760,7 +760,7 @@ def test_multi_speaker_transcript_appended():
 
     captured_older_turns: list[list[Turn]] = []
 
-    def _lm_gen(ctx, conv):  # type: ignore[no-untyped-def]
+    def _lm_gen(ctx, conv, **_kw):  # type: ignore[no-untyped-def]
         captured_older_turns.append(list(conv.older_turns))
         yield "Agent answer."
 
@@ -1349,3 +1349,269 @@ def test_pipeline_skips_warm_up_for_bedrock_llm():
 
     # BedrockClient has no warm_up attribute in its spec.
     assert not hasattr(bedrock_llm_mock, "warm_up") or not bedrock_llm_mock.warm_up.called
+
+
+# ---------------------------------------------------------------------------
+# MCP client wiring tests (V3.0.3)
+# ---------------------------------------------------------------------------
+
+
+def _make_mcp_mocks(*, start_raises: Exception | None = None) -> MagicMock:
+    """Build a mock MCPClient for pipeline wiring tests."""
+    mock_mcp = MagicMock()
+    if start_raises is not None:
+        mock_mcp.start.side_effect = start_raises
+    tool_1 = MagicMock()
+    tool_1.name = "kb_search"
+    tool_2 = MagicMock()
+    tool_2.name = "kb_get"
+    mock_mcp.list_tools.return_value = [tool_1, tool_2]
+    return mock_mcp
+
+
+def _run_pipeline_with_mcp(
+    mock_asr: MagicMock,
+    mock_classifier: MagicMock,
+    mock_llm: MagicMock,
+    mock_tts: MagicMock,
+    mock_mcp: MagicMock,
+    config: PipelineConfig,
+    mock_tracer: MagicMock | None = None,
+) -> Pipeline:
+    """Patch all V2 + MCP boundaries and run Pipeline.run() to completion."""
+    tracer_return = (mock_tracer, None) if mock_tracer is not None else (MagicMock(), None)
+    with (
+        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_llm_client", return_value=mock_llm),
+        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+        patch("meeting_agent.audio.play"),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
+        patch("meeting_agent.pipeline.MCPClient", return_value=mock_mcp),
+        patch("meeting_agent.pipeline._install_trace", return_value=tracer_return),
+    ):
+        pipeline = Pipeline(config)
+        pipeline.run()
+    return pipeline
+
+
+def test_pipeline_starts_mcp_client_when_configured():
+    """When mcp_server is configured, MCPClient.start() and list_tools() are called."""
+    from meeting_agent.mcp_client import MCPServerConfig
+
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(utterances=[])
+    mock_mcp = _make_mcp_mocks()
+    mock_tracer = MagicMock()
+    mock_tracer.enabled = False
+
+    config = PipelineConfig(
+        mcp_server=MCPServerConfig(command="uv", args=("run", "personal-kb-mcp"))
+    )
+    _run_pipeline_with_mcp(
+        mock_asr, mock_classifier, mock_llm, mock_tts, mock_mcp, config, mock_tracer
+    )
+
+    mock_mcp.start.assert_called_once()
+    mock_mcp.list_tools.assert_called_once()
+
+    emitted_events = [c.args[0] for c in mock_tracer.emit.call_args_list]
+    assert "mcp_ready" in emitted_events
+
+
+def test_pipeline_continues_ungrounded_when_mcp_start_fails():
+    """When MCPClient.start() raises MCPClientError, pipeline runs ungrounded."""
+    from meeting_agent.mcp_client import MCPClientError, MCPServerConfig
+
+    utterance = _make_utterance("Hello agent")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_full_answer_decision()],
+        lm_deltas=["Reply."],
+    )
+    mock_mcp = _make_mcp_mocks(start_raises=MCPClientError("server not found"))
+    mock_tracer = MagicMock()
+    mock_tracer.enabled = False
+
+    config = PipelineConfig(mcp_server=MCPServerConfig(command="missing-server", args=()))
+    _run_pipeline_with_mcp(
+        mock_asr, mock_classifier, mock_llm, mock_tts, mock_mcp, config, mock_tracer
+    )
+
+    # mcp_unavailable trace must be emitted
+    emitted_events = [c.args[0] for c in mock_tracer.emit.call_args_list]
+    assert "mcp_unavailable" in emitted_events
+
+    # LLM respond_stream must be called with mcp_client=None
+    assert mock_llm.respond_stream.called
+    call_kwargs = mock_llm.respond_stream.call_args.kwargs
+    assert call_kwargs.get("mcp_client") is None
+
+
+def test_pipeline_passes_mcp_client_to_respond_stream():
+    """When MCP starts successfully, mcp_client kwarg reaches llm.respond_stream."""
+    from meeting_agent.mcp_client import MCPServerConfig
+
+    utterance = _make_utterance("What is the status?")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_full_answer_decision()],
+        lm_deltas=["All good."],
+    )
+    mock_mcp = _make_mcp_mocks()
+    mock_tracer = MagicMock()
+    mock_tracer.enabled = False
+
+    config = PipelineConfig(mcp_server=MCPServerConfig(command="uv", args=("run", "kb")))
+    _run_pipeline_with_mcp(
+        mock_asr, mock_classifier, mock_llm, mock_tts, mock_mcp, config, mock_tracer
+    )
+
+    assert mock_llm.respond_stream.called
+    call_kwargs = mock_llm.respond_stream.call_args.kwargs
+    # The mcp_client kwarg should be the mock MCPClient instance (not None).
+    assert call_kwargs.get("mcp_client") is mock_mcp
+
+
+def test_pipeline_stops_mcp_client_on_shutdown():
+    """MCPClient.stop() is called in the pipeline's finally block on shutdown."""
+    from meeting_agent.mcp_client import MCPServerConfig
+
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(utterances=[])
+    mock_mcp = _make_mcp_mocks()
+
+    config = PipelineConfig(mcp_server=MCPServerConfig(command="uv", args=("run", "kb")))
+    _run_pipeline_with_mcp(mock_asr, mock_classifier, mock_llm, mock_tts, mock_mcp, config)
+
+    mock_mcp.stop.assert_called_once()
+
+
+def test_pipeline_stops_mcp_client_on_keyboard_interrupt():
+    """MCPClient.stop() is called even when the pipeline is interrupted (Ctrl-C)."""
+    from meeting_agent.mcp_client import MCPServerConfig
+
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(utterances=[])
+    mock_mcp = _make_mcp_mocks()
+
+    # Make ASR's transcribe_stream raise KeyboardInterrupt to simulate Ctrl-C.
+    mock_asr.transcribe_stream.side_effect = KeyboardInterrupt
+
+    config = PipelineConfig(mcp_server=MCPServerConfig(command="uv", args=("run", "kb")))
+    _run_pipeline_with_mcp(mock_asr, mock_classifier, mock_llm, mock_tts, mock_mcp, config)
+
+    mock_mcp.stop.assert_called_once()
+
+
+def test_pipeline_no_mcp_client_without_flag():
+    """Without mcp_server in config, no MCPClient is created and mcp_client=None."""
+    utterance = _make_utterance("What is the status?")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_full_answer_decision()],
+        lm_deltas=["Fine."],
+    )
+
+    _run_v2_pipeline(mock_asr, mock_classifier, mock_llm, mock_tts)
+
+    # respond_stream must be called with mcp_client=None (the default)
+    assert mock_llm.respond_stream.called
+    call_kwargs = mock_llm.respond_stream.call_args.kwargs
+    assert call_kwargs.get("mcp_client") is None
+
+
+def test_pipeline_logs_warning_when_mcp_server_advertises_zero_tools(caplog):
+    """Pipeline logs a warning when MCP server starts but advertises 0 tools."""
+    import logging
+
+    from meeting_agent.mcp_client import MCPServerConfig
+
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(utterances=[])
+    mock_mcp = MagicMock()
+    mock_mcp.list_tools.return_value = []  # Zero tools advertised
+
+    config = PipelineConfig(mcp_server=MCPServerConfig(command="uv", args=("run", "kb")))
+
+    with caplog.at_level(logging.WARNING, logger="meeting_agent.pipeline"):
+        _run_pipeline_with_mcp(mock_asr, mock_classifier, mock_llm, mock_tts, mock_mcp, config)
+
+    assert any("0 tools" in r.message for r in caplog.records), (
+        f"Expected 0-tools warning, got: {[r.message for r in caplog.records]}"
+    )
+
+
+def test_pipeline_handles_mcp_stop_exception_on_startup_failure():
+    """Pipeline survives when both start() and cleanup stop() raise exceptions."""
+    from meeting_agent.mcp_client import MCPClientError, MCPServerConfig
+
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(utterances=[])
+    mock_mcp = MagicMock()
+    mock_mcp.start.side_effect = MCPClientError("cannot start")
+    mock_mcp.stop.side_effect = RuntimeError("stop also failed")
+
+    config = PipelineConfig(mcp_server=MCPServerConfig(command="missing-server", args=()))
+    # Must not raise — the pipeline handles both start and cleanup errors gracefully.
+    _run_pipeline_with_mcp(mock_asr, mock_classifier, mock_llm, mock_tts, mock_mcp, config)
+
+
+# ---------------------------------------------------------------------------
+# OllamaClient MCP warning test (V3.0.3)
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_llm_logs_warning_when_mcp_client_supplied(caplog):
+    """OllamaClient.respond_stream logs a one-time warning when mcp_client is supplied."""
+    from meeting_agent.llm import Conversation, OllamaClient, ProjectContext, Turn
+
+    mock_mcp = MagicMock()
+
+    ollama_client = OllamaClient()
+
+    # Mock the Ollama HTTP client to return a single token.
+    mock_ollama_http = MagicMock()
+    mock_ollama_http.chat.return_value = iter([{"message": {"content": "hi"}}])
+
+    conversation = Conversation(
+        older_turns=[],
+        latest_turn=Turn(speaker="Jason", text="hello"),
+    )
+    context = ProjectContext(system_prompt="test")
+
+    with (
+        patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama_http),
+        caplog.at_level(logging.WARNING, logger="meeting_agent.llm"),
+    ):
+        # First call — should log the warning.
+        list(ollama_client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    assert any("not supported" in r.message.lower() for r in caplog.records), (
+        f"Expected 'not supported' in warning, got: {[r.message for r in caplog.records]}"
+    )
+
+
+def test_ollama_llm_warning_issued_only_once(caplog):
+    """OllamaClient.respond_stream logs the MCP warning only once per instance."""
+    from meeting_agent.llm import Conversation, OllamaClient, ProjectContext, Turn
+
+    mock_mcp = MagicMock()
+    ollama_client = OllamaClient()
+    mock_ollama_http = MagicMock()
+    mock_ollama_http.chat.return_value = iter([{"message": {"content": "hi"}}])
+
+    conversation = Conversation(
+        older_turns=[],
+        latest_turn=Turn(speaker="Jason", text="hello"),
+    )
+    context = ProjectContext(system_prompt="test")
+
+    with (
+        patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama_http),
+        caplog.at_level(logging.WARNING, logger="meeting_agent.llm"),
+    ):
+        # Two calls with mcp_client — warning should appear only once.
+        mock_ollama_http.chat.return_value = iter([{"message": {"content": "hi"}}])
+        list(ollama_client.respond_stream(context, conversation, mcp_client=mock_mcp))
+        mock_ollama_http.chat.return_value = iter([{"message": {"content": "hi"}}])
+        list(ollama_client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    mcp_warnings = [r for r in caplog.records if "not supported" in r.message.lower()]
+    assert len(mcp_warnings) == 1, f"Expected exactly 1 warning, got {len(mcp_warnings)}"

@@ -178,6 +178,48 @@ def _emit_verbose_line(record: Mapping[str, Any]) -> None:
         text = str(record.get("utterance_text", ""))[:60]
         line = f'{prefix} utterance_received: "{text}"'
 
+    elif event == "mcp_ready":
+        tool_count = record.get("tool_count", 0)
+        tool_names = record.get("tool_names", [])
+        duration_s = float(record.get("duration_s", 0.0))
+        names_str = ", ".join(str(n) for n in tool_names[:5])
+        if len(tool_names) > 5:
+            names_str += f", +{len(tool_names) - 5} more"
+        line = (
+            f"{prefix} {GREEN}mcp_ready{RESET}: "
+            f"tools={tool_count} [{names_str}] startup={duration_s:.2f}s"
+        )
+
+    elif event == "mcp_unavailable":
+        error_msg = str(record.get("error_msg", ""))[:80]
+        line = f"{prefix} {RED}mcp_unavailable{RESET}: {error_msg}"
+
+    elif event == "mcp_stopped":
+        line = f"{prefix} {DIM}mcp_stopped{RESET}"
+
+    elif event == "mcp_disabled_after_failures":
+        error_count = record.get("error_count", 0)
+        window_s = float(record.get("window_s", 60.0))
+        line = (
+            f"{prefix} {RED}mcp_disabled_after_failures{RESET}: "
+            f"errors={error_count} window={window_s:.0f}s"
+        )
+
+    elif event == "tool_invoked":
+        tool_name = str(record.get("tool_name", "?"))
+        duration_s = float(record.get("duration_s", 0.0))
+        is_error = bool(record.get("is_error", False))
+        result_bytes = record.get("result_bytes", 0)
+        status = f"{RED}error{RESET}" if is_error else f"{GREEN}ok{RESET}"
+        line = (
+            f"{prefix}   {YELLOW}tool_invoked{RESET}: {tool_name} "
+            f"→ {status} ({duration_s * 1000:.0f}ms, {result_bytes}B)"
+        )
+
+    elif event == "tool_iteration_cap_hit":
+        iterations = record.get("iterations", 0)
+        line = f"{prefix} {RED}tool_iteration_cap_hit{RESET}: iterations={iterations}"
+
     else:
         # Generic fallback — truncate aggressively
         line = f"{prefix} {event}: {dict(record)}"

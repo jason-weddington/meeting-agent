@@ -105,9 +105,9 @@ source = ["meeting_agent"]
 # do not lower past the measured floor.
 fail_under = 99.8
 
-# NOTE: Actual total coverage is 99.81% after V3.0.2 Bedrock tool-use loop.
+# NOTE: Actual total coverage is 99.82% after V3.0.3 Pipeline wiring + --kb-mcp.
 # Two uncovered lines remain: audio.py:90 (hardware-path branch) and
-# cli.py:228 (__name__ == "__main__" guard).
+# cli.py:250 (__name__ == "__main__" guard).
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]

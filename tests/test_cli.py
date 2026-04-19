@@ -358,3 +358,45 @@ def test_cli_llm_model_defaults_to_none():
     mock_cls = _run_main_with_pipeline(["meeting-agent"])
     config = mock_cls.call_args[0][0]
     assert config.llm_model is None
+
+
+# ---------------------------------------------------------------------------
+# --kb-mcp flag
+# ---------------------------------------------------------------------------
+
+
+def test_cli_kb_mcp_defaults_to_none():
+    """No --kb-mcp flag → PipelineConfig.mcp_server is None."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent"])
+    config = mock_cls.call_args[0][0]
+    assert config.mcp_server is None
+
+
+def test_cli_kb_mcp_parses_command():
+    """--kb-mcp 'uv run srv' parses to MCPServerConfig(command='uv', args=('run', 'srv'))."""
+    from meeting_agent.mcp_client import MCPServerConfig
+
+    mock_cls = _run_main_with_pipeline(["meeting-agent", "--kb-mcp", "uv run srv"])
+    config = mock_cls.call_args[0][0]
+
+    assert config.mcp_server == MCPServerConfig(command="uv", args=("run", "srv"))
+
+
+def test_cli_kb_mcp_with_path():
+    """--kb-mcp '/path/to/srv --flag' parses to MCPServerConfig with path and flag."""
+    from meeting_agent.mcp_client import MCPServerConfig
+
+    mock_cls = _run_main_with_pipeline(["meeting-agent", "--kb-mcp", "/path/to/srv --flag"])
+    config = mock_cls.call_args[0][0]
+
+    assert config.mcp_server == MCPServerConfig(command="/path/to/srv", args=("--flag",))
+
+
+def test_cli_kb_mcp_single_token():
+    """--kb-mcp with a single token (no args) produces empty args tuple."""
+    from meeting_agent.mcp_client import MCPServerConfig
+
+    mock_cls = _run_main_with_pipeline(["meeting-agent", "--kb-mcp", "/usr/local/bin/kb-srv"])
+    config = mock_cls.call_args[0][0]
+
+    assert config.mcp_server == MCPServerConfig(command="/usr/local/bin/kb-srv", args=())

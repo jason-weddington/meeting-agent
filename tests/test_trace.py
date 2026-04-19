@@ -672,3 +672,150 @@ def test_cli_verbose_implies_trace(monkeypatch: pytest.MonkeyPatch) -> None:
     if captured_config:
         assert captured_config[0].trace_enabled is True
         assert captured_config[0].trace_verbose is True
+
+
+# ---------------------------------------------------------------------------
+# V3.0.3: MCP and tool verbose event handlers
+# ---------------------------------------------------------------------------
+
+
+def _make_tracer_stderr() -> tuple[Tracer, io.StringIO]:
+    """Create an enabled verbose tracer with a fake stderr."""
+    fake_stderr = io.StringIO()
+    null_logger = logging.getLogger("test.trace.mcp")
+    null_logger.addHandler(logging.NullHandler())
+    null_logger.propagate = False
+    tracer = Tracer(enabled=True, verbose=True, logger=null_logger)
+    return tracer, fake_stderr
+
+
+def test_emit_verbose_line_mcp_ready() -> None:
+    """mcp_ready events show tool count, tool names, and startup duration."""
+    fake_stderr = io.StringIO()
+    with patch("sys.stderr", fake_stderr):
+        _emit_verbose_line(
+            {
+                "ts": time.time(),
+                "event": "mcp_ready",
+                "tool_count": 3,
+                "tool_names": ["kb_search", "kb_get", "kb_list"],
+                "duration_s": 1.23,
+                "ok": True,
+            }
+        )
+    output = fake_stderr.getvalue()
+    assert "mcp_ready" in output
+    assert "3" in output
+    assert "kb_search" in output
+    assert "1.23" in output
+
+
+def test_emit_verbose_line_mcp_ready_truncates_long_tool_list() -> None:
+    """mcp_ready with >5 tools shows the first 5 and a '+N more' suffix."""
+    fake_stderr = io.StringIO()
+    tool_names = [f"tool_{i}" for i in range(8)]
+    with patch("sys.stderr", fake_stderr):
+        _emit_verbose_line(
+            {
+                "ts": time.time(),
+                "event": "mcp_ready",
+                "tool_count": 8,
+                "tool_names": tool_names,
+                "duration_s": 0.5,
+                "ok": True,
+            }
+        )
+    output = fake_stderr.getvalue()
+    assert "+3 more" in output
+
+
+def test_emit_verbose_line_mcp_unavailable() -> None:
+    """mcp_unavailable events show the error message."""
+    fake_stderr = io.StringIO()
+    with patch("sys.stderr", fake_stderr):
+        _emit_verbose_line(
+            {
+                "ts": time.time(),
+                "event": "mcp_unavailable",
+                "error_type": "MCPClientError",
+                "error_msg": "command not found: personal-kb-mcp",
+            }
+        )
+    output = fake_stderr.getvalue()
+    assert "mcp_unavailable" in output
+    assert "not found" in output
+
+
+def test_emit_verbose_line_mcp_stopped() -> None:
+    """mcp_stopped events produce a non-empty stderr line."""
+    fake_stderr = io.StringIO()
+    with patch("sys.stderr", fake_stderr):
+        _emit_verbose_line({"ts": time.time(), "event": "mcp_stopped"})
+    assert "mcp_stopped" in fake_stderr.getvalue()
+
+
+def test_emit_verbose_line_mcp_disabled_after_failures() -> None:
+    """mcp_disabled_after_failures events show error count and window."""
+    fake_stderr = io.StringIO()
+    with patch("sys.stderr", fake_stderr):
+        _emit_verbose_line(
+            {
+                "ts": time.time(),
+                "event": "mcp_disabled_after_failures",
+                "error_count": 3,
+                "window_s": 60.0,
+            }
+        )
+    output = fake_stderr.getvalue()
+    assert "mcp_disabled_after_failures" in output
+    assert "3" in output
+    assert "60" in output
+
+
+def test_emit_verbose_line_tool_invoked_success() -> None:
+    """Successful tool_invoked events show tool name, duration, and result size."""
+    fake_stderr = io.StringIO()
+    with patch("sys.stderr", fake_stderr):
+        _emit_verbose_line(
+            {
+                "ts": time.time(),
+                "event": "tool_invoked",
+                "tool_name": "kb_search",
+                "duration_s": 0.25,
+                "is_error": False,
+                "result_bytes": 512,
+            }
+        )
+    output = fake_stderr.getvalue()
+    assert "tool_invoked" in output
+    assert "kb_search" in output
+    assert "512" in output
+
+
+def test_emit_verbose_line_tool_invoked_error() -> None:
+    """Error tool_invoked events include 'error' in the output."""
+    fake_stderr = io.StringIO()
+    with patch("sys.stderr", fake_stderr):
+        _emit_verbose_line(
+            {
+                "ts": time.time(),
+                "event": "tool_invoked",
+                "tool_name": "kb_search",
+                "duration_s": 0.1,
+                "is_error": True,
+                "result_bytes": 0,
+            }
+        )
+    output = fake_stderr.getvalue()
+    assert "tool_invoked" in output
+    assert "error" in output
+
+
+def test_emit_verbose_line_tool_iteration_cap_hit() -> None:
+    """tool_iteration_cap_hit events show the iteration count."""
+    fake_stderr = io.StringIO()
+    with patch("sys.stderr", fake_stderr):
+        _emit_verbose_line({"ts": time.time(), "event": "tool_iteration_cap_hit", "iterations": 5})
+    output = fake_stderr.getvalue()
+    assert "tool_iteration_cap_hit" in output
+    assert "5" in output

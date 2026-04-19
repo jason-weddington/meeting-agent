@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import sys
 from pathlib import Path
 
 from meeting_agent.context import load_context
 from meeting_agent.llm import ProjectContext
+from meeting_agent.mcp_client import MCPServerConfig
 from meeting_agent.pipeline import Pipeline, PipelineConfig
 
 DEFAULT_SYSTEM_PROMPT: str = """You are a real-time participant in a meeting, not
@@ -161,6 +163,19 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="URL",
         help="Ollama daemon URL (default: OLLAMA_HOST env var or http://localhost:11434)",
     )
+    parser.add_argument(
+        "--kb-mcp",
+        default=None,
+        dest="kb_mcp",
+        metavar="SERVER_SPEC",
+        help=(
+            "Enable KB grounding via a local stdio MCP server. "
+            "SERVER_SPEC is a shell-lex string: first token is the command, "
+            'remaining tokens are arguments. Example: "uv run personal-kb-mcp". '
+            "Ollama tool-use is not yet supported; grounding only applies when "
+            "--llm-backend=bedrock (the default)."
+        ),
+    )
 
     return parser
 
@@ -204,6 +219,12 @@ def main() -> None:
     trace_enabled: bool = args.trace or args.verbose or os.environ.get("MEETING_AGENT_TRACE") == "1"
     trace_verbose: bool = args.verbose
 
+    # --kb-mcp: parse server spec into MCPServerConfig.
+    mcp_server: MCPServerConfig | None = None
+    if args.kb_mcp is not None:
+        tokens = shlex.split(args.kb_mcp)
+        mcp_server = MCPServerConfig(command=tokens[0], args=tuple(tokens[1:]))
+
     config = PipelineConfig(
         input_device=args.input_device,
         output_device=args.output_device,
@@ -216,6 +237,7 @@ def main() -> None:
         classifier_backend=args.classifier_backend,
         classifier_model=args.classifier_model,
         ollama_host=args.ollama_host,
+        mcp_server=mcp_server,
     )
 
     try:

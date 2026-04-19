@@ -29,7 +29,7 @@ from meeting_agent.mcp_client import MCPClientError
 if TYPE_CHECKING:
     from mypy_boto3_bedrock_runtime import BedrockRuntimeClient
 
-    from meeting_agent.mcp_client import MCPClient, ToolSpec
+    from meeting_agent.mcp_client import MCPClientLike, ToolSpec
     from meeting_agent.trace import Tracer
 
 _logger = logging.getLogger(__name__)
@@ -179,8 +179,18 @@ class LLMClient(Protocol):
         self,
         context: ProjectContext,
         conversation: Conversation,
+        mcp_client: MCPClientLike | None = None,
+        tracer: Tracer | None = None,
     ) -> Iterator[str]:
-        """Yield text deltas from the LLM's streamed response."""
+        """Yield text deltas from the LLM's streamed response.
+
+        Args:
+            context: Stable per-meeting context (system prompt, agenda, etc.).
+            conversation: Rolling transcript.  ``latest_turn`` must be set.
+            mcp_client: Optional MCP client for KB grounding.  Backends that
+                do not support tool-use accept but ignore this argument.
+            tracer: Optional structured trace emitter.
+        """
         ...
 
 
@@ -218,7 +228,7 @@ class BedrockClient:
         self,
         context: ProjectContext,
         conversation: Conversation,
-        mcp_client: MCPClient | None = None,
+        mcp_client: MCPClientLike | None = None,
         tracer: Tracer | None = None,
     ) -> Iterator[str]:
         """Yield text deltas from Claude's streamed response.
@@ -252,6 +262,7 @@ class BedrockClient:
             conversation: Rolling transcript. ``latest_turn`` must be set.
             mcp_client: Optional MCP client. When ``None``, no tools are
                 exposed to the model and the method behaves as in V3.0.1.
+                Accepts any object satisfying :class:`MCPClientLike`.
             tracer: Optional structured trace emitter. Emits
                 ``tool_invoked`` and ``tool_iteration_cap_hit`` events.
 
@@ -607,6 +618,7 @@ class OllamaClient:
         self.host = host or os.environ.get("OLLAMA_HOST") or self.DEFAULT_HOST
         self.timeout_s = timeout_s
         self._client: ollama.Client | None = None
+        self._mcp_warning_issued: bool = False  # one-time warning guard
 
     def _get_client(self) -> ollama.Client:
         """Return the Ollama client, creating it if needed."""
@@ -646,6 +658,8 @@ class OllamaClient:
         self,
         context: ProjectContext,
         conversation: Conversation,
+        mcp_client: MCPClientLike | None = None,
+        tracer: Tracer | None = None,
     ) -> Iterator[str]:
         """Stream response deltas from local Ollama.
 
@@ -655,12 +669,30 @@ class OllamaClient:
           other speaker names map to ``role: "user"`` with speaker prefixes.
           Consecutive non-agent turns are collapsed into a single user message.
 
+        Note: Ollama tool-use is not yet supported (post-V3.0 roadmap item).
+        ``mcp_client`` and ``tracer`` are accepted for protocol uniformity but
+        ``mcp_client`` is silently ignored after logging a one-time warning.
+        Use ``--llm-backend bedrock`` to enable KB grounding.
+
+        Args:
+            context: Stable per-meeting context (system prompt, agenda, etc.).
+            conversation: Rolling transcript.  ``latest_turn`` must be set.
+            mcp_client: Accepted for protocol uniformity; ignored by Ollama.
+            tracer: Accepted for protocol uniformity; unused by Ollama.
+
         Raises:
             ValueError: If ``conversation.latest_turn`` is ``None``.
             ValueError: If ``conversation.latest_turn.speaker`` is ``"agent"``.
             Exception: Re-raises any Ollama client error so the pipeline's
                 circuit breaker can observe the failure.
         """
+        if mcp_client is not None and not self._mcp_warning_issued:
+            _logger.warning(
+                "OllamaClient: Ollama tool-use not supported; ignoring MCP client. "
+                "Use --llm-backend bedrock for KB grounding."
+            )
+            self._mcp_warning_issued = True
+
         if conversation.latest_turn is None:
             raise ValueError("Conversation.latest_turn must be set")
         if conversation.latest_turn.speaker == "agent":
