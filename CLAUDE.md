@@ -140,6 +140,64 @@ module you're working on; do not change signatures without updating callers.
 - Integration tests that need real models/audio go under `tests/integration/`
   and are opt-in (marked `@pytest.mark.integration`, skipped by default in CI).
 
+## Smoke test plan — V3.0 KB grounding
+
+Run this manually after any merge that touches MCP grounding, `pipeline.py`,
+`llm.py`, or `mcp_client.py`.
+
+### Prerequisites
+
+- `personal-kb-mcp` binary available (or a compatible stdio MCP server).
+- AWS Bedrock auth active (`AWS_PROFILE` or env creds with `bedrock-runtime` access).
+- `qwen3.6-mlx` model warmed up in the local Ollama daemon (classifier backend).
+
+### Run command
+
+```bash
+uv run meeting-agent \
+    --kb-mcp "uv run personal-kb-mcp" \
+    --classifier-backend ollama \
+    --trace \
+    --verbose
+```
+
+### Expected trace events (in order)
+
+| Event | What to check |
+|---|---|
+| `mcp_ready` | `tool_count > 0`, `tool_names` lists real KB tools |
+| `utterance_received` | Text of your spoken utterance |
+| `classifier_decision` | `decision_action == "full_answer"` at least once |
+| `tool_invoked` | `tool_name` matches a KB tool, `is_error == false` |
+| `response_emitted` | `response_text` cites KB content; `total_turn_latency_s` in range |
+| `mcp_stopped` | Fires on Ctrl-C shutdown |
+
+### Failure modes to verify
+
+- **Kill MCP server mid-session**: `pkill -f personal-kb-mcp` while the agent
+  is running.  Expect `mcp_disabled_after_failures` trace event; the pipeline
+  should continue ungrounded (further turns still respond, just without KB).
+
+- **MCP server not found at startup**: pass a bad path, e.g.
+  `--kb-mcp "no-such-binary"`.  Expect `mcp_unavailable` trace event; pipeline
+  should start normally without grounding.
+
+### Latency expectations
+
+| Path | Expected |
+|---|---|
+| Ungrounded turn (no `--kb-mcp`) | 3–5 s |
+| Grounded turn (KB lookup + Bedrock) | 5–7 s |
+
+If grounded turns consistently exceed 8–10 s, open a new task for investigation
+(possible causes: MCP subprocess cold-start, KB index size, Bedrock region).
+
+### Measured baseline
+
+TODO: Jason measures and fills in after first post-V3.0 run.
+
+---
+
 ## Git workflow
 
 Branch-based (`feat/...`, `fix/...`, `chore/...`). Squash-merge to main with a
