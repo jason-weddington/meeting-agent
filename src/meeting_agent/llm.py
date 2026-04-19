@@ -13,19 +13,28 @@ without touching orchestration logic.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from collections.abc import Iterator
+import time
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 import boto3
 import ollama
 
+from meeting_agent.mcp_client import MCPClientError
+
 if TYPE_CHECKING:
     from mypy_boto3_bedrock_runtime import BedrockRuntimeClient
 
+    from meeting_agent.mcp_client import MCPClient, ToolSpec
+    from meeting_agent.trace import Tracer
+
 _logger = logging.getLogger(__name__)
+
+MAX_TOOL_ITERATIONS: int = 5
 
 
 def _log_cache_hit(logger: logging.Logger, call: str, usage: dict[str, Any]) -> None:
@@ -131,6 +140,33 @@ def _build_messages(conversation: Conversation) -> list[dict[str, Any]]:
     return messages
 
 
+def _mcp_tools_to_bedrock_toolconfig(tools: Sequence[ToolSpec]) -> dict[str, Any]:
+    """Translate MCP ToolSpec list into Bedrock converse_stream toolConfig.
+
+    Args:
+        tools: List of :class:`~meeting_agent.mcp_client.ToolSpec` descriptors
+            returned by ``MCPClient.list_tools()``.
+
+    Returns:
+        A ``toolConfig`` dict suitable for passing to ``converse_stream``.
+        Uses ``toolChoice: auto`` so Claude decides whether to use any tool.
+    """
+    return {
+        "tools": [
+            {
+                "toolSpec": {
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": {"json": t.input_schema},
+                }
+            }
+            for t in tools
+        ],
+        # Not forcing a tool — let Claude decide whether to use any.
+        "toolChoice": {"auto": {}},
+    }
+
+
 class LLMClient(Protocol):
     """Streaming response-LLM interface — turns a conversation into text deltas.
 
@@ -157,6 +193,7 @@ class BedrockClient:
       * Stream text deltas out as a ``str`` iterator for the TTS pipeline.
       * Expose cache-hit metrics from the response so the pipeline can log
         effective TTFT.
+      * Optionally drive an MCP tool-use loop when ``mcp_client`` is supplied.
     """
 
     DEFAULT_MODEL_ID: str = DEFAULT_MODEL_ID
@@ -181,8 +218,22 @@ class BedrockClient:
         self,
         context: ProjectContext,
         conversation: Conversation,
+        mcp_client: MCPClient | None = None,
+        tracer: Tracer | None = None,
     ) -> Iterator[str]:
         """Yield text deltas from Claude's streamed response.
+
+        When ``mcp_client`` is ``None`` the method behaves exactly as it did
+        before V3.0.2 — a single ``converse_stream`` call with no tools.
+
+        When ``mcp_client`` is supplied the method:
+
+        1. Fetches the server's tool list and builds a Bedrock ``toolConfig``.
+        2. Streams text deltas, yielding them as they arrive.
+        3. On ``stopReason=tool_use``, executes each requested tool via the
+           MCP client, appends the results, and restarts the stream.
+        4. Loops until ``stopReason=end_turn`` or the
+           :data:`MAX_TOOL_ITERATIONS` cap is reached.
 
         V2 speaker rules:
         - ``latest_turn`` must be set and must not have ``speaker == "agent"``.
@@ -195,6 +246,14 @@ class BedrockClient:
         Callers should split deltas on sentence boundaries (``.``, ``?``,
         ``!``) before feeding them to ``tts.TTS.stream_synthesize`` for
         low-latency playback.
+
+        Args:
+            context: Stable per-meeting context (system prompt, agenda, etc.).
+            conversation: Rolling transcript. ``latest_turn`` must be set.
+            mcp_client: Optional MCP client. When ``None``, no tools are
+                exposed to the model and the method behaves as in V3.0.1.
+            tracer: Optional structured trace emitter. Emits
+                ``tool_invoked`` and ``tool_iteration_cap_hit`` events.
 
         Raises:
             ValueError: If ``conversation.latest_turn`` is ``None``.
@@ -223,7 +282,7 @@ class BedrockClient:
 
         messages = _build_messages(conversation)
 
-        request = {
+        request: dict[str, Any] = {
             "modelId": self.model_id,
             "system": [
                 {"text": system_text},
@@ -232,26 +291,214 @@ class BedrockClient:
             "messages": messages,
         }
 
-        client = self._get_client()
-        response = client.converse_stream(**request)  # type: ignore[arg-type]
+        bedrock = self._get_client()
 
-        for event in response["stream"]:
-            if "contentBlockDelta" in event:
-                delta = event["contentBlockDelta"]["delta"]
-                if "text" in delta:
-                    yield delta["text"]
-            elif "metadata" in event:
-                usage: dict[str, Any] = event["metadata"].get("usage", {})  # type: ignore[assignment]
-                _logger.info(
-                    "response_llm_usage",
-                    extra={
-                        "input_tokens": usage.get("inputTokens", 0),
-                        "output_tokens": usage.get("outputTokens", 0),
-                        "cache_read_tokens": usage.get("cacheReadInputTokens", 0),
-                        "cache_write_tokens": usage.get("cacheWriteInputTokens", 0),
-                    },
+        # ---------------------------------------------------------------
+        # Fast path: no MCP client — single stream, no toolConfig.
+        # Behaviour is identical to pre-V3.0.2.
+        # ---------------------------------------------------------------
+        if mcp_client is None:
+            response = bedrock.converse_stream(**request)
+            for event in response["stream"]:
+                if "contentBlockDelta" in event:
+                    delta = event["contentBlockDelta"]["delta"]
+                    if "text" in delta:
+                        yield delta["text"]
+                elif "metadata" in event:
+                    usage: dict[str, Any] = event["metadata"].get("usage", {})  # type: ignore[assignment]
+                    _logger.info(
+                        "response_llm_usage",
+                        extra={
+                            "input_tokens": usage.get("inputTokens", 0),
+                            "output_tokens": usage.get("outputTokens", 0),
+                            "cache_read_tokens": usage.get("cacheReadInputTokens", 0),
+                            "cache_write_tokens": usage.get("cacheWriteInputTokens", 0),
+                        },
+                    )
+                    _log_cache_hit(_logger, "response_llm", usage)
+            return
+
+        # ---------------------------------------------------------------
+        # MCP tool-use loop
+        # ---------------------------------------------------------------
+        tools = mcp_client.list_tools()
+        request["toolConfig"] = _mcp_tools_to_bedrock_toolconfig(tools)
+
+        for _iteration in range(MAX_TOOL_ITERATIONS):
+            request["messages"] = messages
+
+            response = bedrock.converse_stream(**request)
+
+            # content_blocks: index → {type, ...accumulated data}
+            content_blocks: dict[int, dict[str, Any]] = {}
+            stop_reason = "end_turn"
+
+            for event in response["stream"]:
+                if "contentBlockStart" in event:
+                    cbs = event["contentBlockStart"]
+                    idx: int = cbs["contentBlockIndex"]
+                    start = cbs.get("start", {})
+                    if "toolUse" in start:
+                        content_blocks[idx] = {
+                            "type": "toolUse",
+                            "toolUseId": start["toolUse"]["toolUseId"],
+                            "name": start["toolUse"]["name"],
+                            "input_json": "",
+                        }
+                    else:
+                        content_blocks[idx] = {"type": "text", "text": ""}
+
+                elif "contentBlockDelta" in event:
+                    cbd = event["contentBlockDelta"]
+                    idx = cbd.get("contentBlockIndex", 0)
+                    delta = cbd["delta"]
+                    if "text" in delta:
+                        yield delta["text"]
+                        if idx in content_blocks:
+                            content_blocks[idx]["text"] = (
+                                content_blocks[idx].get("text", "") + delta["text"]
+                            )
+                        else:
+                            content_blocks[idx] = {"type": "text", "text": delta["text"]}
+                    elif "toolUse" in delta and idx in content_blocks:
+                        content_blocks[idx]["input_json"] += delta["toolUse"].get("input", "")
+
+                elif "messageStop" in event:
+                    stop_reason = event["messageStop"].get("stopReason", "end_turn")
+
+                elif "metadata" in event:
+                    usage = event["metadata"].get("usage", {})  # type: ignore[assignment]
+                    _logger.info(
+                        "response_llm_usage",
+                        extra={
+                            "input_tokens": usage.get("inputTokens", 0),
+                            "output_tokens": usage.get("outputTokens", 0),
+                            "cache_read_tokens": usage.get("cacheReadInputTokens", 0),
+                            "cache_write_tokens": usage.get("cacheWriteInputTokens", 0),
+                        },
+                    )
+                    _log_cache_hit(_logger, "response_llm", usage)
+
+            # Terminal stop reasons — text already yielded, nothing more to do.
+            if stop_reason != "tool_use":
+                return
+
+            # ------------------------------------------------------------------
+            # Build assistant content (text blocks + toolUse blocks in order).
+            # ------------------------------------------------------------------
+            assistant_content: list[dict[str, Any]] = []
+            tool_uses_to_execute: list[dict[str, Any]] = []
+
+            for idx in sorted(content_blocks.keys()):
+                block = content_blocks[idx]
+                if block["type"] == "text" and block.get("text"):
+                    assistant_content.append({"text": block["text"]})
+                elif block["type"] == "toolUse":
+                    try:
+                        input_data: dict[str, Any] = (
+                            json.loads(block["input_json"]) if block["input_json"] else {}
+                        )
+                    except json.JSONDecodeError:
+                        _logger.warning(
+                            "Failed to parse tool input JSON for tool %r; using empty dict.",
+                            block["name"],
+                        )
+                        input_data = {}
+                    assistant_content.append(
+                        {
+                            "toolUse": {
+                                "toolUseId": block["toolUseId"],
+                                "name": block["name"],
+                                "input": input_data,
+                            }
+                        }
+                    )
+                    tool_uses_to_execute.append(
+                        {
+                            "toolUseId": block["toolUseId"],
+                            "name": block["name"],
+                            "input": input_data,
+                        }
+                    )
+
+            if not tool_uses_to_execute:
+                # tool_use stopReason but no toolUse blocks — defensive guard.
+                return
+
+            messages.append({"role": "assistant", "content": assistant_content})
+
+            # ------------------------------------------------------------------
+            # Execute tool calls (possibly in parallel from Claude's perspective,
+            # but serially here — sync client).
+            # ------------------------------------------------------------------
+            tool_result_content: list[dict[str, Any]] = []
+
+            for tu in tool_uses_to_execute:
+                t0 = time.monotonic()
+                is_error = False
+                result_text = ""
+                status = "success"
+
+                try:
+                    tool_result = mcp_client.call_tool(tu["name"], tu["input"])
+                    duration_s = time.monotonic() - t0
+                    is_error = tool_result.is_error
+                    result_text = tool_result.content
+                    # Non-text content is not supported in V3.0.2.
+                    if not result_text and tool_result.is_error:
+                        result_text = "tool returned an error with no content"
+                    status = "error" if is_error else "success"
+
+                except MCPClientError as exc:
+                    duration_s = time.monotonic() - t0
+                    is_error = True
+                    result_text = f"MCP client error: {type(exc).__name__}"
+                    status = "error"
+                    _logger.warning(
+                        "MCPClientError calling tool %r: %s",
+                        tu["name"],
+                        exc,
+                    )
+
+                except Exception:
+                    _logger.exception(
+                        "Unexpected error calling tool %r; aborting tool-use loop.",
+                        tu["name"],
+                    )
+                    raise
+
+                if tracer is not None:
+                    tracer.emit(
+                        "tool_invoked",
+                        tool_name=tu["name"],
+                        arguments_preview=json.dumps(tu["input"])[:200],
+                        duration_s=duration_s,
+                        result_bytes=len(result_text.encode()),
+                        is_error=is_error,
+                    )
+
+                tool_result_content.append(
+                    {
+                        "toolResult": {
+                            "toolUseId": tu["toolUseId"],
+                            "content": [{"text": result_text}],
+                            "status": status,
+                        }
+                    }
                 )
-                _log_cache_hit(_logger, "response_llm", usage)
+
+            messages.append({"role": "user", "content": tool_result_content})
+
+        # ------------------------------------------------------------------
+        # Iteration cap reached without end_turn.
+        # ------------------------------------------------------------------
+        _logger.warning(
+            "Tool-use iteration cap hit after %d iterations; stopping.",
+            MAX_TOOL_ITERATIONS,
+        )
+        if tracer is not None:
+            tracer.emit("tool_iteration_cap_hit", iterations=MAX_TOOL_ITERATIONS)
+        yield "(tool-use limit reached)"
 
 
 def _build_ollama_messages(
@@ -329,6 +576,9 @@ class OllamaClient:
     server-side via ``keep_alive`` (default 5 min).  The ``think=False`` flag
     disables Qwen3's hybrid-reasoner thinking mode so the model returns plain
     text deltas rather than ``<think>`` blocks.
+
+    Note: Ollama tool use is deferred to a future story (post-V3.0).  See
+    roadmap.
     """
 
     DEFAULT_MODEL: str = "qwen3.6:35b-a3b-mlx-bf16"

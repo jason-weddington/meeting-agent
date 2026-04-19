@@ -103,9 +103,9 @@ source = ["meeting_agent"]
 [tool.coverage.report]
 # Coverage threshold ratchets up as modules gain tests. Keep honest —
 # do not lower past the measured floor.
-fail_under = 99.7
+fail_under = 99.8
 
-# NOTE: Actual total coverage is 99.77% after V2.10 OllamaClient + factory.
+# NOTE: Actual total coverage is 99.81% after V3.0.2 Bedrock tool-use loop.
 # Two uncovered lines remain: audio.py:90 (hardware-path branch) and
 # cli.py:228 (__name__ == "__main__" guard).
 

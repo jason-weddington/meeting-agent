@@ -14,7 +14,10 @@ from meeting_agent.llm import (
     ProjectContext,
     Turn,
     _build_ollama_messages,
+    _mcp_tools_to_bedrock_toolconfig,
 )
+from meeting_agent.mcp_client import MCPClientError, ToolResult, ToolSpec
+from meeting_agent.trace import Tracer
 
 
 def _make_stream(*text_deltas: str, extra_events=None):
@@ -772,3 +775,582 @@ def test_ollama_llm_client_reused_across_calls():
         list(client.respond_stream(context, conversation2))
 
     MockCls.assert_called_once()
+
+
+# ===========================================================================
+# MCP tool-use loop tests (V3.0.2)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helper builders for tool-use event streams
+# ---------------------------------------------------------------------------
+
+
+def _make_tool_use_stream(
+    tool_use_id: str,
+    tool_name: str,
+    tool_input_json: str,
+    text_before: str = "",
+) -> dict:
+    """Build a fake stream that emits an optional text delta then a toolUse block."""
+    events = []
+    block_idx = 0
+
+    if text_before:
+        events.append({"contentBlockStart": {"contentBlockIndex": block_idx, "start": {}}})
+        events.append(
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": block_idx,
+                    "delta": {"text": text_before},
+                }
+            }
+        )
+        block_idx += 1
+
+    events.append(
+        {
+            "contentBlockStart": {
+                "contentBlockIndex": block_idx,
+                "start": {
+                    "toolUse": {
+                        "toolUseId": tool_use_id,
+                        "name": tool_name,
+                    }
+                },
+            }
+        }
+    )
+    events.append(
+        {
+            "contentBlockDelta": {
+                "contentBlockIndex": block_idx,
+                "delta": {"toolUse": {"input": tool_input_json}},
+            }
+        }
+    )
+    events.append({"messageStop": {"stopReason": "tool_use"}})
+    return {"stream": iter(events)}
+
+
+def _make_end_turn_stream(*text_deltas: str) -> dict:
+    """Build a stream that emits text deltas then end_turn."""
+    events = []
+    if text_deltas:
+        events.append({"contentBlockStart": {"contentBlockIndex": 0, "start": {}}})
+        for delta in text_deltas:
+            events.append(
+                {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 0,
+                        "delta": {"text": delta},
+                    }
+                }
+            )
+    events.append({"messageStop": {"stopReason": "end_turn"}})
+    return {"stream": iter(events)}
+
+
+def _make_multi_tool_use_stream(
+    tools: list[tuple[str, str, str]],
+) -> dict:
+    """Build a stream emitting multiple toolUse blocks in one turn.
+
+    Each element of *tools* is ``(tool_use_id, name, input_json)``.
+    """
+    events = []
+    for idx, (tool_use_id, name, input_json) in enumerate(tools):
+        events.append(
+            {
+                "contentBlockStart": {
+                    "contentBlockIndex": idx,
+                    "start": {
+                        "toolUse": {
+                            "toolUseId": tool_use_id,
+                            "name": name,
+                        }
+                    },
+                }
+            }
+        )
+        events.append(
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": idx,
+                    "delta": {"toolUse": {"input": input_json}},
+                }
+            }
+        )
+    events.append({"messageStop": {"stopReason": "tool_use"}})
+    return {"stream": iter(events)}
+
+
+def _make_mcp_client(
+    tools: list[ToolSpec] | None = None,
+    call_tool_return: ToolResult | None = None,
+    call_tool_side_effect: Exception | None = None,
+) -> MagicMock:
+    """Build a MagicMock that looks like an MCPClient."""
+    mock = MagicMock()
+    mock.list_tools.return_value = tools or [
+        ToolSpec(name="search", description="Search the KB", input_schema={"type": "object"})
+    ]
+    if call_tool_side_effect is not None:
+        mock.call_tool.side_effect = call_tool_side_effect
+    else:
+        mock.call_tool.return_value = call_tool_return or ToolResult(
+            content="result", is_error=False
+        )
+    return mock
+
+
+# ---------------------------------------------------------------------------
+# Test: mcp_client=None → identical behaviour to pre-V3.0.2
+# ---------------------------------------------------------------------------
+
+
+def test_respond_stream_without_mcp_client_unchanged():
+    """Passing mcp_client=None is identical to pre-V3.0.2: no toolConfig, single stream."""
+    mock_bedrock = _make_client_mock(_make_stream("hello", " world"))
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        result = list(client.respond_stream(context, conversation, mcp_client=None))
+
+    assert result == ["hello", " world"]
+    call_kwargs = mock_bedrock.converse_stream.call_args[1]
+    assert "toolConfig" not in call_kwargs
+    mock_bedrock.converse_stream.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Test: toolConfig is passed when mcp_client is given
+# ---------------------------------------------------------------------------
+
+
+def test_respond_stream_passes_toolconfig_when_mcp_client_given():
+    """converse_stream receives a toolConfig with the tools from list_tools()."""
+    tool1 = ToolSpec(
+        name="kb_search",
+        description="Search KB",
+        input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+    tool2 = ToolSpec(name="kb_get", description="Get KB entry", input_schema={"type": "object"})
+
+    mock_bedrock = _make_client_mock(_make_end_turn_stream("done"))
+    mock_mcp = _make_mcp_client(tools=[tool1, tool2])
+
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Search for X"))
+        list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    call_kwargs = mock_bedrock.converse_stream.call_args[1]
+    assert "toolConfig" in call_kwargs
+    tc = call_kwargs["toolConfig"]
+    assert tc["toolChoice"] == {"auto": {}}
+    assert len(tc["tools"]) == 2
+    names = {t["toolSpec"]["name"] for t in tc["tools"]}
+    assert names == {"kb_search", "kb_get"}
+    # Verify inputSchema shape
+    assert tc["tools"][0]["toolSpec"]["inputSchema"] == {"json": tool1.input_schema} or tc["tools"][
+        1
+    ]["toolSpec"]["inputSchema"] == {"json": tool1.input_schema}
+
+
+# ---------------------------------------------------------------------------
+# Test: tool_use stopReason → execute tool, append result, continue
+# ---------------------------------------------------------------------------
+
+
+def test_respond_stream_executes_tool_use_and_continues():
+    """Turn-1 emits toolUse; call_tool is invoked; turn-2 yields final text."""
+    turn1 = _make_tool_use_stream(
+        tool_use_id="tu-1",
+        tool_name="search",
+        tool_input_json='{"query": "weather"}',
+        text_before="Let me check.",
+    )
+    turn2 = _make_end_turn_stream("It is sunny.")
+
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.side_effect = [turn1, turn2]
+
+    mock_mcp = _make_mcp_client(
+        call_tool_return=ToolResult(content="sunny in Seattle", is_error=False)
+    )
+
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Weather?"))
+        result = list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    # Text before tool call + text from second turn
+    assert "Let me check." in result
+    assert "It is sunny." in result
+
+    # call_tool invoked with correct args
+    mock_mcp.call_tool.assert_called_once_with("search", {"query": "weather"})
+
+    # Two converse_stream calls total
+    assert mock_bedrock.converse_stream.call_count == 2
+
+    # Second call's messages include assistant (toolUse) + user (toolResult)
+    second_call_messages = mock_bedrock.converse_stream.call_args_list[1][1]["messages"]
+    roles = [m["role"] for m in second_call_messages]
+    assert "assistant" in roles
+    assert roles[-1] == "user"
+    # The user message has a toolResult block
+    last_msg = second_call_messages[-1]
+    assert last_msg["content"][0]["toolResult"]["toolUseId"] == "tu-1"
+    assert last_msg["content"][0]["toolResult"]["content"][0]["text"] == "sunny in Seattle"
+    assert last_msg["content"][0]["toolResult"]["status"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# Test: multiple toolUse blocks in one turn (parallel execution)
+# ---------------------------------------------------------------------------
+
+
+def test_respond_stream_parallel_tool_use():
+    """Model emits 2 toolUse blocks; both call_tool calls are made; one user message."""
+    turn1 = _make_multi_tool_use_stream(
+        [
+            ("tu-1", "search", '{"query": "A"}'),
+            ("tu-2", "get", '{"id": "B"}'),
+        ]
+    )
+    turn2 = _make_end_turn_stream("Combined result.")
+
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.side_effect = [turn1, turn2]
+
+    mock_mcp = _make_mcp_client()
+    mock_mcp.call_tool.side_effect = [
+        ToolResult(content="result A", is_error=False),
+        ToolResult(content="result B", is_error=False),
+    ]
+
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Query both"))
+        result = list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    assert result == ["Combined result."]
+    assert mock_mcp.call_tool.call_count == 2
+
+    # The toolResult user message should have 2 toolResult blocks
+    second_messages = mock_bedrock.converse_stream.call_args_list[1][1]["messages"]
+    last_msg = second_messages[-1]
+    assert last_msg["role"] == "user"
+    assert len(last_msg["content"]) == 2
+    tool_use_ids = {blk["toolResult"]["toolUseId"] for blk in last_msg["content"]}
+    assert tool_use_ids == {"tu-1", "tu-2"}
+
+
+# ---------------------------------------------------------------------------
+# Test: MCPClientError → toolResult with status=error, loop continues
+# ---------------------------------------------------------------------------
+
+
+def test_respond_stream_handles_mcp_client_error_as_tool_error():
+    """MCPClientError from call_tool → toolResult status=error; stream continues."""
+    turn1 = _make_tool_use_stream("tu-1", "search", '{"query": "X"}')
+    turn2 = _make_end_turn_stream("Sorry, I could not search.")
+
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.side_effect = [turn1, turn2]
+
+    mock_mcp = _make_mcp_client(call_tool_side_effect=MCPClientError("timeout"))
+
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Search X"))
+        result = list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    # Second turn text should still be yielded
+    assert "Sorry, I could not search." in result
+
+    # The toolResult should have status=error
+    second_messages = mock_bedrock.converse_stream.call_args_list[1][1]["messages"]
+    last_msg = second_messages[-1]
+    tr = last_msg["content"][0]["toolResult"]
+    assert tr["status"] == "error"
+    assert "MCPClientError" in tr["content"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Test: iteration cap
+# ---------------------------------------------------------------------------
+
+
+def test_respond_stream_caps_tool_iterations():
+    """Loop stops after MAX_TOOL_ITERATIONS and yields the sentinel."""
+    from meeting_agent.llm import MAX_TOOL_ITERATIONS
+
+    # Each call returns a tool_use stream
+    streams = [
+        _make_tool_use_stream(f"tu-{i}", "search", '{"query": "q"}')
+        for i in range(MAX_TOOL_ITERATIONS + 2)
+    ]
+
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.side_effect = streams
+
+    mock_mcp = _make_mcp_client()
+
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Go"))
+        result = list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    # Sentinel must be in the output
+    assert "(tool-use limit reached)" in result
+
+    # converse_stream called exactly MAX_TOOL_ITERATIONS times
+    assert mock_bedrock.converse_stream.call_count == MAX_TOOL_ITERATIONS
+
+    # call_tool called MAX_TOOL_ITERATIONS times (one per iteration)
+    assert mock_mcp.call_tool.call_count == MAX_TOOL_ITERATIONS
+
+
+# ---------------------------------------------------------------------------
+# Test: _mcp_tools_to_bedrock_toolconfig pure function
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_tools_to_bedrock_toolconfig_translates_correctly():
+    """_mcp_tools_to_bedrock_toolconfig maps ToolSpec fields to Bedrock toolSpec."""
+    tools = [
+        ToolSpec(
+            name="kb_search",
+            description="Search the knowledge base",
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        ),
+        ToolSpec(
+            name="kb_get",
+            description="",
+            input_schema={"type": "object"},
+        ),
+    ]
+    config = _mcp_tools_to_bedrock_toolconfig(tools)
+
+    assert config["toolChoice"] == {"auto": {}}
+    assert len(config["tools"]) == 2
+
+    spec0 = config["tools"][0]["toolSpec"]
+    assert spec0["name"] == "kb_search"
+    assert spec0["description"] == "Search the knowledge base"
+    assert spec0["inputSchema"] == {
+        "json": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+    }
+
+    spec1 = config["tools"][1]["toolSpec"]
+    assert spec1["name"] == "kb_get"
+    assert spec1["description"] == ""
+    assert spec1["inputSchema"] == {"json": {"type": "object"}}
+
+
+# ---------------------------------------------------------------------------
+# Test: tracer.emit called with correct fields after a tool call
+# ---------------------------------------------------------------------------
+
+
+def test_respond_stream_emits_tool_invoked_trace():
+    """tracer.emit is called with tool_invoked and the expected fields."""
+    turn1 = _make_tool_use_stream("tu-1", "search", '{"query": "test"}')
+    turn2 = _make_end_turn_stream("Here you go.")
+
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.side_effect = [turn1, turn2]
+
+    mock_mcp = _make_mcp_client(call_tool_return=ToolResult(content="found it", is_error=False))
+
+    tracer = MagicMock(spec=Tracer)
+    tracer.enabled = True
+
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Search"))
+        list(client.respond_stream(context, conversation, mcp_client=mock_mcp, tracer=tracer))
+
+    # tracer.emit should have been called at least once with tool_invoked
+    emit_calls = tracer.emit.call_args_list
+    tool_invoked_calls = [c for c in emit_calls if c[0][0] == "tool_invoked"]
+    assert len(tool_invoked_calls) == 1
+
+    _, kwargs = tool_invoked_calls[0]
+    assert kwargs["tool_name"] == "search"
+    assert "query" in kwargs["arguments_preview"]
+    assert kwargs["result_bytes"] == len(b"found it")
+    assert kwargs["is_error"] is False
+    assert "duration_s" in kwargs
+
+
+# ---------------------------------------------------------------------------
+# Coverage fill: defensive branches in the tool-use loop
+# ---------------------------------------------------------------------------
+
+
+def test_respond_stream_handles_text_delta_without_start_in_tool_loop():
+    """In the tool-use loop, a text delta for an idx without a prior
+    contentBlockStart still yields and registers the block (defensive path)."""
+    events = [
+        {"contentBlockDelta": {"contentBlockIndex": 5, "delta": {"text": "hello"}}},
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+    turn = {"stream": iter(events)}
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.return_value = turn
+    mock_mcp = _make_mcp_client()
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="x")
+        conv = Conversation(latest_turn=Turn(speaker="Jason", text="hi"))
+        result = list(client.respond_stream(context, conv, mcp_client=mock_mcp))
+    assert result == ["hello"]
+
+
+def test_respond_stream_logs_metadata_usage_in_tool_loop(caplog):
+    """metadata event in the tool-use loop path emits response_llm_usage."""
+    events = [
+        {"contentBlockStart": {"contentBlockIndex": 0, "start": {}}},
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "hi"}}},
+        {
+            "metadata": {
+                "usage": {
+                    "inputTokens": 100,
+                    "outputTokens": 20,
+                    "cacheReadInputTokens": 80,
+                    "cacheWriteInputTokens": 0,
+                }
+            }
+        },
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+    turn = {"stream": iter(events)}
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.return_value = turn
+    mock_mcp = _make_mcp_client()
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="x")
+        conv = Conversation(latest_turn=Turn(speaker="Jason", text="hi"))
+        with caplog.at_level(logging.INFO, logger="meeting_agent.llm"):
+            list(client.respond_stream(context, conv, mcp_client=mock_mcp))
+    records = [r for r in caplog.records if r.getMessage() == "response_llm_usage"]
+    assert len(records) == 1
+    assert records[0].input_tokens == 100
+    assert records[0].cache_read_tokens == 80
+
+
+def test_respond_stream_handles_malformed_tool_input_json():
+    """Invalid JSON in toolUse input falls back to empty dict in call_tool."""
+    events = [
+        {
+            "contentBlockStart": {
+                "contentBlockIndex": 0,
+                "start": {"toolUse": {"toolUseId": "tu-1", "name": "search"}},
+            }
+        },
+        {
+            "contentBlockDelta": {
+                "contentBlockIndex": 0,
+                "delta": {"toolUse": {"input": "not-json{"}},
+            }
+        },
+        {"messageStop": {"stopReason": "tool_use"}},
+    ]
+    turn1 = {"stream": iter(events)}
+    turn2 = _make_end_turn_stream("ok")
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.side_effect = [turn1, turn2]
+    mock_mcp = _make_mcp_client(call_tool_return=ToolResult(content="result", is_error=False))
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="x")
+        conv = Conversation(latest_turn=Turn(speaker="Jason", text="hi"))
+        list(client.respond_stream(context, conv, mcp_client=mock_mcp))
+    mock_mcp.call_tool.assert_called_once_with("search", {})
+
+
+def test_respond_stream_tool_use_stop_with_no_tool_blocks():
+    """stopReason=tool_use but no toolUse blocks — defensive guard returns cleanly."""
+    events = [
+        {"contentBlockStart": {"contentBlockIndex": 0, "start": {}}},
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "hi"}}},
+        {"messageStop": {"stopReason": "tool_use"}},
+    ]
+    turn = {"stream": iter(events)}
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.return_value = turn
+    mock_mcp = _make_mcp_client()
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="x")
+        conv = Conversation(latest_turn=Turn(speaker="Jason", text="hi"))
+        result = list(client.respond_stream(context, conv, mcp_client=mock_mcp))
+    assert result == ["hi"]
+    mock_mcp.call_tool.assert_not_called()
+
+
+def test_respond_stream_tool_error_with_empty_content():
+    """ToolResult with is_error=True and empty content gets default error message."""
+    turn1 = _make_tool_use_stream("tu-1", "search", "{}")
+    turn2 = _make_end_turn_stream("done")
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.side_effect = [turn1, turn2]
+    mock_mcp = _make_mcp_client(call_tool_return=ToolResult(content="", is_error=True))
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="x")
+        conv = Conversation(latest_turn=Turn(speaker="Jason", text="hi"))
+        list(client.respond_stream(context, conv, mcp_client=mock_mcp))
+    second_msgs = mock_bedrock.converse_stream.call_args_list[1][1]["messages"]
+    tool_result_text = second_msgs[-1]["content"][0]["toolResult"]["content"][0]["text"]
+    assert tool_result_text == "tool returned an error with no content"
+
+
+def test_respond_stream_reraises_unexpected_tool_exception():
+    """Non-MCPClientError exception in call_tool propagates (for circuit breaker)."""
+    turn = _make_tool_use_stream("tu-1", "search", "{}")
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.return_value = turn
+    mock_mcp = _make_mcp_client(call_tool_side_effect=RuntimeError("unexpected"))
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="x")
+        conv = Conversation(latest_turn=Turn(speaker="Jason", text="hi"))
+        with pytest.raises(RuntimeError, match="unexpected"):
+            list(client.respond_stream(context, conv, mcp_client=mock_mcp))
+
+
+def test_respond_stream_tool_iteration_cap_emits_trace():
+    """When iteration cap hits with a tracer, tool_iteration_cap_hit event fires."""
+    turns = [_make_tool_use_stream(f"tu-{i}", "search", '{"q": "x"}') for i in range(10)]
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.side_effect = turns
+    mock_mcp = _make_mcp_client(call_tool_return=ToolResult(content="r", is_error=False))
+    mock_tracer = MagicMock()
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="x")
+        conv = Conversation(latest_turn=Turn(speaker="Jason", text="hi"))
+        list(client.respond_stream(context, conv, mcp_client=mock_mcp, tracer=mock_tracer))
+    event_names = [call.args[0] for call in mock_tracer.emit.call_args_list]
+    assert "tool_iteration_cap_hit" in event_names
