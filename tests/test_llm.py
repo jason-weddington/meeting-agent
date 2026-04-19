@@ -1,4 +1,4 @@
-"""Unit tests for meeting_agent.llm — BedrockClient with native multi-turn messages."""
+"""Unit tests for meeting_agent.llm — BedrockClient and OllamaClient."""
 
 from __future__ import annotations
 
@@ -10,8 +10,10 @@ import pytest
 from meeting_agent.llm import (
     BedrockClient,
     Conversation,
+    OllamaClient,
     ProjectContext,
     Turn,
+    _build_ollama_messages,
 )
 
 
@@ -429,3 +431,344 @@ def test_respond_stream_cache_hit_skipped_when_zero_input_tokens(caplog):
     assert len(usage_records) == 1
     cache_records = [r for r in caplog.records if "cache:" in (r.getMessage() or "")]
     assert len(cache_records) == 0
+
+
+# ===========================================================================
+# OllamaClient tests
+# ===========================================================================
+
+
+def _make_ollama_stream(*content_parts: str) -> list[dict]:
+    """Build a fake ollama chat stream (list of chunk dicts)."""
+    return [{"message": {"content": part}} for part in content_parts]
+
+
+def _make_ollama_client_mock(stream_chunks: list[dict]) -> MagicMock:
+    """Return a mock ollama.Client whose chat() returns a stream iterator."""
+    mock_client = MagicMock()
+    mock_client.chat.return_value = iter(stream_chunks)
+    return mock_client
+
+
+# ---------------------------------------------------------------------------
+# Init / defaults
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_llm_init_honors_defaults():
+    """OllamaClient uses DEFAULT_MODEL and DEFAULT_HOST when no args are given."""
+    client = OllamaClient()
+    assert client.model == OllamaClient.DEFAULT_MODEL
+    assert client.host == OllamaClient.DEFAULT_HOST
+    assert client._client is None
+
+
+def test_ollama_llm_init_honors_model_override():
+    """Custom model is stored on the client."""
+    client = OllamaClient(model="llama3.2:latest")
+    assert client.model == "llama3.2:latest"
+
+
+def test_ollama_llm_init_honors_host_override():
+    """Explicit host wins over environment variable."""
+    client = OllamaClient(host="http://myserver:11434")
+    assert client.host == "http://myserver:11434"
+
+
+def test_ollama_llm_init_honors_env_host(monkeypatch):
+    """OLLAMA_HOST env var is used when no explicit host is given."""
+    monkeypatch.setenv("OLLAMA_HOST", "http://envserver:11434")
+    client = OllamaClient()
+    assert client.host == "http://envserver:11434"
+
+
+def test_ollama_llm_init_explicit_host_wins_over_env(monkeypatch):
+    """Explicit host takes precedence over OLLAMA_HOST env var."""
+    monkeypatch.setenv("OLLAMA_HOST", "http://envserver:11434")
+    client = OllamaClient(host="http://explicit:11434")
+    assert client.host == "http://explicit:11434"
+
+
+# ---------------------------------------------------------------------------
+# warm_up
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_llm_warm_up_sends_minimal_chat():
+    """warm_up sends a 1-token chat call with think=False."""
+    mock_ollama = MagicMock()
+    mock_ollama.chat.return_value = {"message": {"content": "ok"}}
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        result = client.warm_up()
+
+    assert result is True
+    mock_ollama.chat.assert_called_once()
+    call_kwargs = mock_ollama.chat.call_args[1]
+    assert call_kwargs["think"] is False
+    assert call_kwargs["options"]["num_predict"] == 1
+
+
+def test_ollama_llm_warm_up_returns_false_on_failure(caplog):
+    """warm_up returns False and logs a warning if the call fails."""
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = ConnectionError("daemon not running")
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        with caplog.at_level(logging.WARNING, logger="meeting_agent.llm"):
+            result = client.warm_up()
+
+    assert result is False
+    assert any("warm_up" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# respond_stream — streaming behavior
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_llm_respond_stream_yields_deltas():
+    """respond_stream yields all content deltas from the stream in order."""
+    chunks = _make_ollama_stream("Hello", " there", "!")
+    mock_ollama = _make_ollama_client_mock(chunks)
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        result = list(client.respond_stream(context, conversation))
+
+    assert result == ["Hello", " there", "!"]
+
+
+def test_ollama_llm_respond_stream_passes_think_false():
+    """respond_stream passes think=False to ollama.Client.chat."""
+    chunks = _make_ollama_stream("ok")
+    mock_ollama = _make_ollama_client_mock(chunks)
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        list(client.respond_stream(context, conversation))
+
+    call_kwargs = mock_ollama.chat.call_args[1]
+    assert call_kwargs["think"] is False
+
+
+def test_ollama_llm_respond_stream_passes_stream_true():
+    """respond_stream passes stream=True to ollama.Client.chat."""
+    chunks = _make_ollama_stream("ok")
+    mock_ollama = _make_ollama_client_mock(chunks)
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        list(client.respond_stream(context, conversation))
+
+    call_kwargs = mock_ollama.chat.call_args[1]
+    assert call_kwargs["stream"] is True
+
+
+def test_ollama_llm_respond_stream_raises_on_failure():
+    """respond_stream re-raises on failure so the circuit breaker can observe it."""
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = ConnectionError("daemon down")
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+
+        with pytest.raises(ConnectionError):
+            list(client.respond_stream(context, conversation))
+
+
+def test_ollama_llm_respond_stream_raises_on_none_latest_turn():
+    """respond_stream raises ValueError when conversation.latest_turn is None."""
+    client = OllamaClient()
+    context = ProjectContext(system_prompt="Be helpful.")
+    conversation = Conversation(latest_turn=None)
+
+    with pytest.raises(ValueError, match="latest_turn"):
+        list(client.respond_stream(context, conversation))
+
+
+def test_ollama_llm_respond_stream_raises_on_agent_latest_turn():
+    """respond_stream raises ValueError when latest_turn speaker is 'agent'."""
+    client = OllamaClient()
+    context = ProjectContext(system_prompt="Be helpful.")
+    conversation = Conversation(latest_turn=Turn(speaker="agent", text="I speak"))
+
+    with pytest.raises(ValueError, match="agent"):
+        list(client.respond_stream(context, conversation))
+
+
+def test_ollama_llm_respond_stream_skips_empty_deltas():
+    """respond_stream skips chunks with empty content strings."""
+    chunks = [
+        {"message": {"content": "Hello"}},
+        {"message": {"content": ""}},
+        {"message": {"content": " world"}},
+    ]
+    mock_ollama = _make_ollama_client_mock(chunks)
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        result = list(client.respond_stream(context, conversation))
+
+    assert result == ["Hello", " world"]
+
+
+# ---------------------------------------------------------------------------
+# _build_ollama_messages — message shape tests
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_llm_system_prompt_is_first_message():
+    """_build_ollama_messages puts the system prompt as the first message."""
+    context = ProjectContext(system_prompt="You are a meeting bot.")
+    conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+    messages = _build_ollama_messages(conversation, context)
+
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"] == "You are a meeting bot."
+
+
+def test_ollama_llm_system_text_joins_non_empty_fields():
+    """All non-empty ProjectContext fields are joined into the system message."""
+    context = ProjectContext(
+        system_prompt="You are a meeting bot.",
+        agenda="1. Kickoff",
+        project_docs="Design doc.",
+        decision_log="Decision: use Python.",
+        stakeholders="Alice, Bob",
+    )
+    conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+    messages = _build_ollama_messages(conversation, context)
+
+    system_content = messages[0]["content"]
+    assert "You are a meeting bot." in system_content
+    assert "1. Kickoff" in system_content
+    assert "Design doc." in system_content
+    assert "Decision: use Python." in system_content
+    assert "Alice, Bob" in system_content
+
+
+def test_ollama_llm_assistant_role_for_agent_turns():
+    """Agent turns in older_turns map to role: 'assistant'."""
+    context = ProjectContext(system_prompt="Be helpful.")
+    conversation = Conversation(
+        older_turns=[Turn(speaker="agent", text="I am the agent.")],
+        latest_turn=Turn(speaker="Jason", text="Tell me more"),
+    )
+    messages = _build_ollama_messages(conversation, context)
+
+    assistant_msgs = [m for m in messages if m["role"] == "assistant"]
+    assert len(assistant_msgs) == 1
+    assert assistant_msgs[0]["content"] == "I am the agent."
+
+
+def test_ollama_llm_user_role_collapses_non_agent_speakers():
+    """Consecutive non-agent turns collapse into one user message with speaker prefixes."""
+    context = ProjectContext(system_prompt="Be helpful.")
+    conversation = Conversation(
+        older_turns=[
+            Turn(speaker="Jason", text="q1"),
+            Turn(speaker="Aziz", text="q2"),
+            Turn(speaker="agent", text="a1"),
+            Turn(speaker="Marcus", text="q3"),
+        ],
+        latest_turn=Turn(speaker="Jason", text="q4"),
+    )
+    messages = _build_ollama_messages(conversation, context)
+
+    # Filter out the system message.
+    non_system = [m for m in messages if m["role"] != "system"]
+    assert non_system == [
+        {"role": "user", "content": "Jason: q1\nAziz: q2"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "Marcus: q3\nJason: q4"},
+    ]
+
+
+def test_ollama_llm_first_turn_messages_shape():
+    """With no older_turns, messages is system + one user message."""
+    context = ProjectContext(system_prompt="Be helpful.")
+    conversation = Conversation(
+        older_turns=[],
+        latest_turn=Turn(speaker="Jason", text="First message"),
+    )
+    messages = _build_ollama_messages(conversation, context)
+
+    assert messages[0]["role"] == "system"
+    assert messages[1] == {"role": "user", "content": "Jason: First message"}
+    assert len(messages) == 2
+
+
+def test_ollama_llm_no_cache_point_in_messages():
+    """_build_ollama_messages never includes 'cachePoint' in any message."""
+    context = ProjectContext(system_prompt="Be helpful.", agenda="1. Items")
+    conversation = Conversation(
+        older_turns=[Turn(speaker="Jason", text="hello")],
+        latest_turn=Turn(speaker="Jason", text="world"),
+    )
+    messages = _build_ollama_messages(conversation, context)
+
+    for msg in messages:
+        assert "cachePoint" not in msg
+
+
+# ---------------------------------------------------------------------------
+# OllamaClient lazy client creation
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_llm_lazy_client_creation():
+    """OllamaClient construction does not create an ollama.Client."""
+    with patch("meeting_agent.llm.ollama.Client") as mock_cls:
+        client = OllamaClient()
+        mock_cls.assert_not_called()
+        assert client._client is None
+
+
+def test_ollama_llm_client_created_with_correct_host():
+    """ollama.Client is created with the configured host on first call."""
+    chunks = _make_ollama_stream("ok")
+    mock_ollama = _make_ollama_client_mock(chunks)
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama) as MockCls:
+        client = OllamaClient(host="http://testhost:11434")
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        list(client.respond_stream(context, conversation))
+
+    MockCls.assert_called_once_with(
+        host="http://testhost:11434", timeout=OllamaClient.DEFAULT_TIMEOUT_S
+    )
+
+
+def test_ollama_llm_client_reused_across_calls():
+    """The ollama.Client is created only once across multiple respond_stream calls."""
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = [
+        iter(_make_ollama_stream("first")),
+        iter(_make_ollama_stream("second")),
+    ]
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama) as MockCls:
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+
+        conversation1 = Conversation(latest_turn=Turn(speaker="Jason", text="First"))
+        list(client.respond_stream(context, conversation1))
+
+        conversation2 = Conversation(latest_turn=Turn(speaker="Jason", text="Second"))
+        list(client.respond_stream(context, conversation2))
+
+    MockCls.assert_called_once()

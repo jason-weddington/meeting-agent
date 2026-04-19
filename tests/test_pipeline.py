@@ -12,7 +12,7 @@ import pytest
 
 from meeting_agent.asr import Utterance
 from meeting_agent.classifier import BedrockClassifier, Decision, OllamaClassifier
-from meeting_agent.llm import Turn
+from meeting_agent.llm import BedrockClient, OllamaClient, Turn
 from meeting_agent.pipeline import (
     AirtimeTracker,
     CircuitBreaker,
@@ -21,6 +21,7 @@ from meeting_agent.pipeline import (
     Pipeline,
     PipelineConfig,
     _build_classifier,
+    _build_llm_client,
     _install_exception_log,
     _is_low_confidence,
     _split_at_sentence_boundaries,
@@ -118,7 +119,7 @@ def _run_v2_pipeline(
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
         patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline._build_llm_client", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
         patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
@@ -469,7 +470,7 @@ def test_silent_decision_appends_and_skips_response():
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
         patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline._build_llm_client", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
         patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
@@ -495,25 +496,12 @@ def test_hedged_and_full_decisions_trigger_response():
     mock_llm.respond_stream.assert_called_once()
 
 
-def test_bedrock_client_constructed_with_model_id():
-    """BedrockClient is created with model_id from PipelineConfig."""
-    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
-        utterances=[],
-    )
-    config = PipelineConfig(model_id="us.anthropic.claude-opus-4-5")
-
-    with (
-        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
-        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
-        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm) as MockLLM,
-        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
-        patch("meeting_agent.audio.play"),
-        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
-    ):
-        Pipeline(config).run()
-
-    MockLLM.assert_called_once_with(model_id="us.anthropic.claude-opus-4-5")
+def test_llm_model_override_reaches_bedrock_backend_pipeline():
+    """llm_model override is forwarded to BedrockClient via _build_llm_client."""
+    config = PipelineConfig(llm_model="us.anthropic.claude-opus-4-5")
+    llm = _build_llm_client(config)
+    assert isinstance(llm, BedrockClient)
+    assert llm.model_id == "us.anthropic.claude-opus-4-5"
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +544,7 @@ def test_deafness_probe_fires_after_threshold_drops():
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
         patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline._build_llm_client", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
         patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
@@ -604,7 +592,7 @@ def test_staleness_gate_downgrades_above_1_5s():
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
         patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline._build_llm_client", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
         patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
@@ -639,7 +627,7 @@ def test_staleness_gate_drops_above_5s():
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
         patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline._build_llm_client", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
         patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
@@ -682,7 +670,7 @@ def test_circuit_breaker_opens_after_3_failures():
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
         patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline._build_llm_client", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
         patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
@@ -732,7 +720,7 @@ def test_airtime_count_passed_to_classifier():
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
         patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline._build_llm_client", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
         patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
@@ -786,7 +774,7 @@ def test_multi_speaker_transcript_appended():
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
         patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline._build_llm_client", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
         patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
@@ -819,7 +807,7 @@ def test_keyboard_interrupt_exits_cleanly():
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
         patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline._build_llm_client", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
         patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
@@ -1208,7 +1196,7 @@ def test_pipeline_warms_up_ollama_classifier_on_run():
             patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
             patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
             patch("meeting_agent.pipeline._build_classifier", return_value=classifier),
-            patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+            patch("meeting_agent.pipeline._build_llm_client", return_value=mock_llm),
             patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
             patch("meeting_agent.audio.play"),
             patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
@@ -1237,7 +1225,7 @@ def test_pipeline_skips_warm_up_for_bedrock_classifier():
         patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
         patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
         patch("meeting_agent.pipeline._build_classifier", return_value=bedrock_mock),
-        patch("meeting_agent.pipeline.BedrockClient", return_value=mock_llm),
+        patch("meeting_agent.pipeline._build_llm_client", return_value=mock_llm),
         patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
         patch("meeting_agent.audio.play"),
         patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
@@ -1247,3 +1235,117 @@ def test_pipeline_skips_warm_up_for_bedrock_classifier():
     # BedrockClassifier has no warm_up attribute → MagicMock(spec=...) would also
     # not expose one. Assert that no warm_up was attempted.
     assert not hasattr(bedrock_mock, "warm_up") or not bedrock_mock.warm_up.called
+
+
+# ---------------------------------------------------------------------------
+# Response-LLM factory unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_llm_factory_selects_bedrock_by_default():
+    """Default PipelineConfig produces a BedrockClient."""
+    config = PipelineConfig()
+    llm = _build_llm_client(config)
+    assert isinstance(llm, BedrockClient)
+
+
+def test_llm_factory_selects_ollama_when_configured():
+    """llm_backend='ollama' in PipelineConfig produces an OllamaClient."""
+    config = PipelineConfig(llm_backend="ollama")
+    llm = _build_llm_client(config)
+    assert isinstance(llm, OllamaClient)
+
+
+def test_llm_model_override_reaches_bedrock_backend():
+    """llm_model override is forwarded to BedrockClient.model_id."""
+    config = PipelineConfig(llm_model="us.anthropic.claude-opus-4-5")
+    llm = _build_llm_client(config)
+    assert isinstance(llm, BedrockClient)
+    assert llm.model_id == "us.anthropic.claude-opus-4-5"
+
+
+def test_llm_model_override_reaches_ollama_backend():
+    """llm_model override is forwarded to OllamaClient.model."""
+    config = PipelineConfig(
+        llm_backend="ollama",
+        llm_model="qwen3.6:35b-a3b-mlx-bf16",
+    )
+    llm = _build_llm_client(config)
+    assert isinstance(llm, OllamaClient)
+    assert llm.model == "qwen3.6:35b-a3b-mlx-bf16"
+
+
+def test_llm_factory_bedrock_default_model():
+    """BedrockClient uses its DEFAULT_MODEL_ID when llm_model is None."""
+    config = PipelineConfig()
+    llm = _build_llm_client(config)
+    assert isinstance(llm, BedrockClient)
+    assert llm.model_id == BedrockClient.DEFAULT_MODEL_ID
+
+
+def test_llm_factory_ollama_default_model():
+    """OllamaClient uses its DEFAULT_MODEL when llm_model is None."""
+    config = PipelineConfig(llm_backend="ollama")
+    llm = _build_llm_client(config)
+    assert isinstance(llm, OllamaClient)
+    assert llm.model == OllamaClient.DEFAULT_MODEL
+
+
+def test_pipeline_warms_up_ollama_llm_on_run():
+    """Pipeline.run() calls warm_up() on an OllamaClient LLM backend before the first utterance."""
+    mock_ollama_client = MagicMock()
+    mock_ollama_client.chat.return_value = {"message": {"content": "ok"}}
+
+    utterance = _make_utterance("Hello agent")
+    mock_asr, mock_classifier, _, mock_tts = _make_v2_mocks(utterances=[utterance])
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama_client):
+        llm = OllamaClient()
+        # Patch respond_stream so the pipeline's per-utterance call doesn't muddy
+        # the warm_up call-count assertion.
+        llm.respond_stream = MagicMock(  # type: ignore[method-assign]
+            return_value=iter(["Reply."])
+        )
+
+        with (
+            patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+            patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+            patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
+            patch("meeting_agent.pipeline._build_llm_client", return_value=llm),
+            patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+            patch("meeting_agent.audio.play"),
+            patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
+        ):
+            Pipeline(PipelineConfig(llm_backend="ollama")).run()
+
+    # warm_up() uses a minimal 1-token request; exactly one such call expected.
+    warmup_calls = [
+        c for c in mock_ollama_client.chat.call_args_list if c[1]["options"]["num_predict"] == 1
+    ]
+    assert len(warmup_calls) == 1, "warm_up() should issue exactly one minimal chat call"
+
+
+def test_pipeline_skips_warm_up_for_bedrock_llm():
+    """Pipeline.run() does not call warm_up on a Bedrock LLM (no-op path)."""
+    utterance = _make_utterance("Hello agent")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_full_answer_decision(speaker="Jason")],
+    )
+    # Spec'd as BedrockClient so isinstance(llm, OllamaClient) is False.
+    bedrock_llm_mock = MagicMock(spec=BedrockClient)
+    bedrock_llm_mock.respond_stream.return_value = iter(["Reply."])
+
+    with (
+        patch("meeting_agent.audio.record_chunks", return_value=_infinite_chunks()),
+        patch("meeting_agent.pipeline.StreamingASR", return_value=mock_asr),
+        patch("meeting_agent.pipeline._build_classifier", return_value=mock_classifier),
+        patch("meeting_agent.pipeline._build_llm_client", return_value=bedrock_llm_mock),
+        patch("meeting_agent.pipeline.TTS", return_value=mock_tts),
+        patch("meeting_agent.audio.play"),
+        patch("meeting_agent.pipeline._install_exception_log", return_value=MagicMock()),
+    ):
+        Pipeline(PipelineConfig()).run()
+
+    # BedrockClient has no warm_up attribute in its spec.
+    assert not hasattr(bedrock_llm_mock, "warm_up") or not bedrock_llm_mock.warm_up.called

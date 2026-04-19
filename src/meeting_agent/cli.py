@@ -11,8 +11,6 @@ from meeting_agent.context import load_context
 from meeting_agent.llm import ProjectContext
 from meeting_agent.pipeline import Pipeline, PipelineConfig
 
-DEFAULT_MODEL_ID: str = "us.anthropic.claude-sonnet-4-6"
-
 DEFAULT_SYSTEM_PROMPT: str = """You are a real-time participant in a meeting, not
 an assistant. Silence is a valid contribution — prefer it when you don't have
 something specifically useful to add. When you do speak, write as you would
@@ -60,10 +58,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print available input + output devices and exit",
     )
     parser.add_argument(
-        "--model-id",
-        default=DEFAULT_MODEL_ID,
-        metavar="ID",
-        help=f"Bedrock model id (default: {DEFAULT_MODEL_ID})",
+        "--llm-backend",
+        choices=["bedrock", "ollama"],
+        default="bedrock",
+        dest="llm_backend",
+        metavar="{bedrock,ollama}",
+        help="Response-LLM backend to use (default: bedrock)",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        dest="llm_model",
+        metavar="MODEL",
+        help=(
+            "Response-LLM model name. "
+            "bedrock default: us.anthropic.claude-sonnet-4-6  "
+            "ollama default: qwen3.6:35b-a3b-mlx-bf16"
+        ),
     )
 
     initial_prompt_group = parser.add_mutually_exclusive_group()
@@ -196,7 +207,8 @@ def main() -> None:
     config = PipelineConfig(
         input_device=args.input_device,
         output_device=args.output_device,
-        model_id=args.model_id,
+        llm_backend=args.llm_backend,
+        llm_model=args.llm_model,
         asr_initial_prompt=initial_prompt,
         context=context,
         trace_enabled=trace_enabled,

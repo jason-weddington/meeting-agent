@@ -35,21 +35,47 @@ uv run python scripts/latency_check.py tts  # TTS latency smoke test
 uv run python scripts/latency_check.py asr  # ASR latency smoke test (needs mic)
 ```
 
-## Classifier backends
+## Inference backends
 
-`meeting-agent` supports two classifier backends:
+`meeting-agent` supports two backends for both the **classifier** and the
+**response LLM**.  Bedrock is the default for both; Ollama enables fully-local
+operation for sensitive meetings.
+
+### Classifier
 
 - **Bedrock Haiku** (default) — `--classifier-backend bedrock`
 - **Local Ollama** — `--classifier-backend ollama` (defaults to `qwen3.6:35b-a3b-mlx-bf16`)
 
-The Ollama backend hits a running `ollama serve` daemon. Use `--ollama-host` or
-the `OLLAMA_HOST` env var to override the default `http://localhost:11434`.
-
-Model is configurable per-run; code is unchanged:
 ```bash
-uv run meeting-agent --classifier-backend ollama                                            # qwen3.6 default
-uv run meeting-agent --classifier-backend ollama --classifier-model qwen3.5:35b-a3b        # fallback
+uv run meeting-agent --classifier-backend ollama                                   # qwen3.6 default
+uv run meeting-agent --classifier-backend ollama --classifier-model qwen3.5:35b-a3b  # fallback
 ```
+
+### Response LLM
+
+- **Bedrock Claude Sonnet** (default) — `--llm-backend bedrock`
+- **Local Ollama** — `--llm-backend ollama` (defaults to `qwen3.6:35b-a3b-mlx-bf16`)
+
+```bash
+uv run meeting-agent --llm-backend ollama                                          # qwen3.6 default
+uv run meeting-agent --llm-backend ollama --llm-model llama3.2:latest             # custom model
+```
+
+### Fully-local mode
+
+Run both backends on Ollama to avoid all Bedrock calls:
+
+```bash
+# Fully local (classifier + response both on Ollama)
+uv run meeting-agent --classifier-backend ollama --llm-backend ollama
+
+# Local classifier + Bedrock response (current V2.9 behavior, still default)
+uv run meeting-agent --classifier-backend ollama
+```
+
+The Ollama backends both hit the same `ollama serve` daemon. Use `--ollama-host`
+or the `OLLAMA_HOST` env var to override the default `http://localhost:11434`
+(shared by both classifier and response-LLM paths).
 
 ## Module layout
 
@@ -59,7 +85,7 @@ src/meeting_agent/
   asr.py         # streaming Whisper (mlx-whisper) + Silero VAD → Utterance stream
   classifier.py  # classifier Protocol + BedrockClassifier + OllamaClassifier
   tts.py         # Kokoro TTS (sentence-by-sentence streaming)
-  llm.py         # Bedrock Claude via converse_stream, with cachePoint breakpoints
+  llm.py         # LLMClient Protocol + BedrockClient + OllamaClient response-LLM backends
   wake.py        # openwakeword wake-word detector
   pipeline.py    # orchestrator: wires modules; maintains rolling transcript
   cli.py         # `meeting-agent run` entry point

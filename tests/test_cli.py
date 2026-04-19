@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from meeting_agent.cli import DEFAULT_MODEL_ID, DEFAULT_SYSTEM_PROMPT, main
+from meeting_agent.cli import DEFAULT_SYSTEM_PROMPT, main
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -80,7 +80,8 @@ def test_default_flags_produce_expected_pipeline_config(monkeypatch):
 
     assert config.input_device is None
     assert config.output_device is None
-    assert config.model_id == DEFAULT_MODEL_ID
+    assert config.llm_model is None
+    assert config.llm_backend == "bedrock"
     assert config.asr_initial_prompt is None
     assert config.context.system_prompt == DEFAULT_SYSTEM_PROMPT
     assert config.context.project_docs == ""
@@ -97,7 +98,7 @@ def test_custom_flags_produce_expected_pipeline_config():
         "3",
         "--output-device",
         "5",
-        "--model-id",
+        "--llm-model",
         "us.anthropic.claude-opus-4-5",
         "--initial-prompt",
         "AWS EKS S3 Lambda",
@@ -110,7 +111,7 @@ def test_custom_flags_produce_expected_pipeline_config():
 
     assert config.input_device == 3
     assert config.output_device == 5
-    assert config.model_id == "us.anthropic.claude-opus-4-5"
+    assert config.llm_model == "us.anthropic.claude-opus-4-5"
     assert config.asr_initial_prompt == "AWS EKS S3 Lambda"
     assert config.context.system_prompt == "Be terse."
 
@@ -324,3 +325,36 @@ def test_cli_ollama_host_defaults_to_none():
     mock_cls = _run_main_with_pipeline(["meeting-agent"])
     config = mock_cls.call_args[0][0]
     assert config.ollama_host is None
+
+
+# ---------------------------------------------------------------------------
+# Response-LLM backend / model flags
+# ---------------------------------------------------------------------------
+
+
+def test_cli_llm_backend_defaults_to_bedrock():
+    """No --llm-backend flag → PipelineConfig.llm_backend == 'bedrock'."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent"])
+    config = mock_cls.call_args[0][0]
+    assert config.llm_backend == "bedrock"
+
+
+def test_cli_llm_backend_ollama():
+    """--llm-backend ollama sets PipelineConfig.llm_backend to 'ollama'."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent", "--llm-backend", "ollama"])
+    config = mock_cls.call_args[0][0]
+    assert config.llm_backend == "ollama"
+
+
+def test_cli_llm_model_forwarded():
+    """--llm-model <name> populates PipelineConfig.llm_model."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent", "--llm-model", "qwen3.6:35b-a3b-mlx-bf16"])
+    config = mock_cls.call_args[0][0]
+    assert config.llm_model == "qwen3.6:35b-a3b-mlx-bf16"
+
+
+def test_cli_llm_model_defaults_to_none():
+    """No --llm-model flag → PipelineConfig.llm_model is None."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent"])
+    config = mock_cls.call_args[0][0]
+    assert config.llm_model is None

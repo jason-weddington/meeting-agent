@@ -102,12 +102,11 @@ source = ["meeting_agent"]
 [tool.coverage.report]
 # Coverage threshold ratchets up as modules gain tests. Keep honest —
 # do not lower past the measured floor.
-fail_under = 99
+fail_under = 99.7
 
-# NOTE: Actual total coverage is 99.66% after V2.3 pipeline rewire. Two
-# uncovered lines remain: audio.py:90 (hardware-path branch) and
-# cli.py:164 (__name__ == "__main__" guard). The old pipeline.py:137
-# (wake-word iterator-exhausted edge case) was removed in V2.3.
+# NOTE: Actual total coverage is 99.77% after V2.10 OllamaClient + factory.
+# Two uncovered lines remain: audio.py:90 (hardware-path branch) and
+# cli.py:228 (__name__ == "__main__" guard).
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]

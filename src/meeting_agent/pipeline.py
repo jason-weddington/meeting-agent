@@ -43,7 +43,14 @@ from meeting_agent.classifier import (
     OllamaClassifier,
     SessionState,
 )
-from meeting_agent.llm import BedrockClient, Conversation, ProjectContext, Turn
+from meeting_agent.llm import (
+    BedrockClient,
+    Conversation,
+    LLMClient,
+    OllamaClient,
+    ProjectContext,
+    Turn,
+)
 from meeting_agent.trace import Tracer
 from meeting_agent.trace import install as _install_trace
 from meeting_agent.tts import SAMPLE_RATE as TTS_SAMPLE_RATE
@@ -273,7 +280,8 @@ class PipelineConfig:
 
     input_device: int | None = None
     output_device: int | None = None
-    model_id: str = "us.anthropic.claude-sonnet-4-6"
+    llm_backend: Literal["bedrock", "ollama"] = "bedrock"
+    llm_model: str | None = None  # None → backend-specific default
     classifier_backend: Literal["bedrock", "ollama"] = "bedrock"
     classifier_model: str | None = None  # None → backend-specific default
     ollama_host: str | None = None
@@ -309,6 +317,26 @@ def _build_classifier(config: PipelineConfig) -> Classifier:
     )
 
 
+def _build_llm_client(config: PipelineConfig) -> LLMClient:
+    """Construct and return the appropriate response-LLM backend from *config*.
+
+    Args:
+        config: Pipeline configuration specifying backend, model, and host.
+
+    Returns:
+        An :class:`OllamaClient` when ``config.llm_backend == "ollama"``;
+        a :class:`BedrockClient` otherwise (default).
+    """
+    if config.llm_backend == "ollama":
+        return OllamaClient(
+            model=config.llm_model or OllamaClient.DEFAULT_MODEL,
+            host=config.ollama_host,
+        )
+    return BedrockClient(
+        model_id=config.llm_model or BedrockClient.DEFAULT_MODEL_ID,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -336,7 +364,7 @@ class Pipeline:
         chunks_iter = audio.record_chunks(device=config.input_device, chunk_ms=_CHUNK_MS)
         asr = StreamingASR(initial_prompt=config.asr_initial_prompt)
         tts = TTS()
-        llm = BedrockClient(model_id=config.model_id)
+        llm: LLMClient = _build_llm_client(config)
         classifier: Classifier = _build_classifier(config)
 
         # Rolling transcript initialised empty.
@@ -364,6 +392,20 @@ class Pipeline:
                 "ollama_warmup",
                 model=classifier.model,
                 host=classifier.host,
+                duration_s=round(time.monotonic() - warm_start, 3),
+                ok=ok,
+            )
+
+        # Pre-warm the Ollama response-LLM if that backend is selected.
+        # Runs sequentially after the classifier warm-up to avoid OOM from
+        # two concurrent large-model loads on memory-constrained machines.
+        if isinstance(llm, OllamaClient):
+            warm_start = time.monotonic()
+            ok = llm.warm_up()
+            tracer.emit(
+                "ollama_llm_warmup",
+                model=llm.model,
+                host=llm.host,
                 duration_s=round(time.monotonic() - warm_start, 3),
                 ok=ok,
             )
@@ -599,7 +641,7 @@ class Pipeline:
         self,
         config: PipelineConfig,
         conversation: Conversation,
-        llm: BedrockClient,
+        llm: LLMClient,
         tts: TTS,
         t_asr_done: float,
         tracer: Tracer,
@@ -630,7 +672,7 @@ class Pipeline:
         Args:
             config: Pipeline config (output device, project context, model id).
             conversation: Rolling transcript with ``latest_turn`` already set.
-            llm: Bedrock client for streaming the response.
+            llm: Response-LLM client for streaming the response.
             tts: TTS instance for synthesis.
             t_asr_done: Monotonic timestamp when ASR finished (latency anchor).
             tracer: Trace emitter (no-op when disabled).
