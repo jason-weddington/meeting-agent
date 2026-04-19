@@ -10,6 +10,7 @@ authors = [
 dependencies = [
     "awscrt>=0.32.1",
     "boto3>=1.42.90",
+    "fastmcp>=2.0",
     "mlx-audio>=0.2.10",
     "mlx-whisper>=0.4.3",
     "numpy>=2.4.4",
