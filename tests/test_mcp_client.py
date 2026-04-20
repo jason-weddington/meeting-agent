@@ -116,8 +116,12 @@ def test_start_blocks_until_ready() -> None:
         client.stop()
 
 
-def test_start_passes_config_to_stdio_transport() -> None:
-    """StdioTransport receives command / args / env from MCPServerConfig."""
+def test_start_passes_config_overrides_on_top_of_parent_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """User-provided env values are layered on top of os.environ."""
+    monkeypatch.setenv("KB_DATABASE_URL", "postgres://parent")
+    monkeypatch.setenv("UNRELATED_VAR", "passthrough")
     mock_client = _make_mock_client()
 
     with (
@@ -128,17 +132,27 @@ def test_start_passes_config_to_stdio_transport() -> None:
         client.start()
 
     try:
-        MockTransport.assert_called_once_with(
-            command="uv",
-            args=["run", "personal-kb-mcp"],
-            env={"HOME": "/home/test"},
-        )
+        MockTransport.assert_called_once()
+        call_kwargs = MockTransport.call_args.kwargs
+        assert call_kwargs["command"] == "uv"
+        assert call_kwargs["args"] == ["run", "personal-kb-mcp"]
+        env_passed = call_kwargs["env"]
+        # The _SIMPLE_CONFIG sets HOME=/home/test as an override — that wins
+        # over whatever HOME is in os.environ.
+        assert env_passed["HOME"] == "/home/test"
+        # Unrelated parent-env vars pass through.
+        assert env_passed["UNRELATED_VAR"] == "passthrough"
+        # This is the bug fix: KB_DATABASE_URL reaches the MCP subprocess.
+        assert env_passed["KB_DATABASE_URL"] == "postgres://parent"
     finally:
         client.stop()
 
 
-def test_start_passes_none_env_when_no_env() -> None:
-    """StdioTransport receives env=None when MCPServerConfig.env is None."""
+def test_start_inherits_parent_env_when_no_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """StdioTransport receives os.environ when MCPServerConfig.env is None."""
+    monkeypatch.setenv("KB_DATABASE_URL", "postgres://from-shell")
     cfg = MCPServerConfig(command="python", args=("-m", "server"))
     mock_client = _make_mock_client()
 
@@ -150,11 +164,38 @@ def test_start_passes_none_env_when_no_env() -> None:
         client.start()
 
     try:
-        MockTransport.assert_called_once_with(
-            command="python",
-            args=["-m", "server"],
-            env=None,
-        )
+        MockTransport.assert_called_once()
+        env_passed = MockTransport.call_args.kwargs["env"]
+        # Parent env passes through by default.
+        assert env_passed["KB_DATABASE_URL"] == "postgres://from-shell"
+        # Should also carry whatever else was in os.environ — spot-check PATH.
+        assert "PATH" in env_passed
+    finally:
+        client.stop()
+
+
+def test_start_user_env_overrides_parent_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When user env and parent env share a key, user value wins."""
+    monkeypatch.setenv("CONFLICTING_KEY", "from-parent")
+    cfg = MCPServerConfig(
+        command="python",
+        args=("-m", "server"),
+        env={"CONFLICTING_KEY": "from-user"},
+    )
+    mock_client = _make_mock_client()
+
+    with (
+        patch("meeting_agent.mcp_client.StdioTransport") as MockTransport,
+        patch("meeting_agent.mcp_client.Client", return_value=mock_client),
+    ):
+        client = MCPClient(cfg)
+        client.start()
+
+    try:
+        env_passed = MockTransport.call_args.kwargs["env"]
+        assert env_passed["CONFLICTING_KEY"] == "from-user"
     finally:
         client.stop()
 

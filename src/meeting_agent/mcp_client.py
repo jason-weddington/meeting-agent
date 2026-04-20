@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -27,6 +28,23 @@ from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 
 _logger = logging.getLogger(__name__)
+
+
+def _resolve_subprocess_env(user_env: Mapping[str, str] | None) -> dict[str, str]:
+    """Build the env mapping passed to the MCP subprocess.
+
+    The underlying MCP SDK's stdio transport sanitizes the child env by
+    default (only HOME, LOGNAME, PATH, SHELL, TERM, USER pass through)
+    so that arbitrary MCP servers can't slurp every env var in the
+    parent process.  For a local, user-run CLI like meeting-agent the
+    user's shell env is trusted — KB_DATABASE_URL, OLLAMA_HOST, AWS_*,
+    and similar need to reach the server.  Start from ``os.environ``
+    and let explicit ``MCPServerConfig.env`` values override on top.
+    """
+    env: dict[str, str] = dict(os.environ)
+    if user_env:
+        env.update(user_env)
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +68,11 @@ class MCPServerConfig:
     Attributes:
         command: Executable to run, e.g. ``"uv"``.
         args: Command-line arguments, e.g. ``("run", "personal-kb-mcp")``.
-        env: Optional environment-variable overrides for the child process.
+        env: Optional environment-variable overrides.  These are layered
+            on top of the parent process env (``os.environ``); the
+            subprocess inherits the parent env by default.  Pass an empty
+            mapping to keep inheritance but set no overrides; there is
+            currently no way to opt into the MCP SDK's sanitized env.
     """
 
     command: str
@@ -155,7 +177,7 @@ class MCPClient:
         transport = StdioTransport(
             command=self.config.command,
             args=list(self.config.args),
-            env=dict(self.config.env) if self.config.env else None,
+            env=_resolve_subprocess_env(self.config.env),
         )
         self._client = Client(transport)
         try:
