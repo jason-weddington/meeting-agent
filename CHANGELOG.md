@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.10.3 (2026-04-20)
+
+### Bug Fixes
+
+- **llm**: Narrate tool calls to avoid dead air
+  ([`78ea1ae`](https://github.com/repos/meeting-agent/commit/78ea1aeba67c1585fba95bb86ec5e4300f5d7e88))
+
+
 ## v0.10.2 (2026-04-20)
 
 ### Bug Fixes
