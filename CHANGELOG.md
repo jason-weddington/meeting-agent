@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.10.2 (2026-04-20)
+
+### Bug Fixes
+
+- **classifier**: Distinguish repeat-request direction; route user asks through
+  ([`8e2a7b4`](https://github.com/repos/meeting-agent/commit/8e2a7b42adfea147fd238498b7cf2ab05af1c3d0))
+
+
 ## v0.10.1 (2026-04-20)
 
 ### Bug Fixes
