@@ -78,6 +78,13 @@ DEFAULT_MODEL_ID: str = "us.anthropic.claude-sonnet-4-6"
 DEFAULT_REGION: str = "us-west-2"
 
 
+def _current_timestamp() -> str:
+    """Return a bracketed ISO timestamp for injection into user messages."""
+    from datetime import datetime  # noqa: PLC0415
+
+    return f"[current_time: {datetime.now().astimezone().isoformat(timespec='minutes')}]"
+
+
 @dataclass
 class ProjectContext:
     """Stable per-meeting context — cached behind a 1-hour breakpoint.
@@ -154,6 +161,8 @@ def _build_messages(conversation: Conversation) -> list[dict[str, Any]]:
         else:
             buffer.append(f"{turn.speaker}: {turn.text}")
 
+    # Inject current timestamp so the model knows "now" for temporal reasoning.
+    buffer.append(_current_timestamp())
     # Append the triggering utterance to the trailing user block.
     buffer.append(f"{conversation.latest_turn.speaker}: {conversation.latest_turn.text}")
     flush_user()
@@ -622,6 +631,8 @@ def _build_ollama_messages(
         else:
             buffer.append(f"{turn.speaker}: {turn.text}")
 
+    # Inject current timestamp so the model knows "now" for temporal reasoning.
+    buffer.append(_current_timestamp())
     # Append the triggering utterance to the trailing user block.
     buffer.append(f"{conversation.latest_turn.speaker}: {conversation.latest_turn.text}")
     flush_user()
