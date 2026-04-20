@@ -82,20 +82,24 @@ or the `OLLAMA_HOST` env var to override the default `http://localhost:11434`
 Enable real-time KB grounding via a local stdio MCP server using `--kb-mcp`:
 
 ```bash
-# Enable KB grounding via a local stdio MCP server
+# Enable KB grounding via a local stdio MCP server (Bedrock default)
 uv run meeting-agent --kb-mcp "uv run personal-kb-mcp" --trace --verbose
 
 # With a path and custom argument
 uv run meeting-agent --kb-mcp "/path/to/personal-kb-mcp --some-arg"
+
+# Fully-local grounded mode (classifier + response + KB all local)
+uv run meeting-agent --classifier-backend ollama --llm-backend ollama --kb-mcp "uv run personal-kb-mcp" --trace --verbose
 ```
 
 `SERVER_SPEC` is parsed with `shlex.split`: first token is the command,
 remaining tokens are arguments.  No env-var passthrough yet — use a wrapper
 script if you need to inject env vars.
 
-**Note:** Ollama tool-use is not yet supported.  The `--kb-mcp` flag is silently
-ignored (with a one-time log warning) when `--llm-backend ollama` is used.
-Grounding currently only applies when the response LLM is Bedrock (the default).
+Both the Bedrock and Ollama response-LLM backends support MCP tool-use
+grounding.  The Ollama path uses Ollama's native `tools=` parameter (V3.0.5).
+Note: the Ollama model must support tool calling — `qwen3.6:35b-a3b-mlx-bf16`
+(the default) does.
 
 ## Module layout
 
@@ -154,9 +158,18 @@ Run this manually after any merge that touches MCP grounding, `pipeline.py`,
 ### Run command
 
 ```bash
+# Bedrock response LLM + Ollama classifier (original smoke-test path)
 uv run meeting-agent \
     --kb-mcp "uv run personal-kb-mcp" \
     --classifier-backend ollama \
+    --trace \
+    --verbose
+
+# Fully-local (both classifier and response LLM on Ollama)
+uv run meeting-agent \
+    --classifier-backend ollama \
+    --llm-backend ollama \
+    --kb-mcp "uv run personal-kb-mcp" \
     --trace \
     --verbose
 ```

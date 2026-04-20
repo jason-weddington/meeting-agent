@@ -15,6 +15,7 @@ from meeting_agent.llm import (
     Turn,
     _build_ollama_messages,
     _mcp_tools_to_bedrock_toolconfig,
+    _mcp_tools_to_ollama_tools,
 )
 from meeting_agent.mcp_client import MCPClientError, ToolResult, ToolSpec
 from meeting_agent.trace import Tracer
@@ -1354,3 +1355,521 @@ def test_respond_stream_tool_iteration_cap_emits_trace():
         list(client.respond_stream(context, conv, mcp_client=mock_mcp, tracer=mock_tracer))
     event_names = [call.args[0] for call in mock_tracer.emit.call_args_list]
     assert "tool_iteration_cap_hit" in event_names
+
+
+# ===========================================================================
+# OllamaClient MCP tool-use loop tests (V3.0.5)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helper builders for Ollama tool-use streams
+# ---------------------------------------------------------------------------
+
+
+def _make_ollama_tool_call(name: str, arguments: dict) -> dict:
+    """Build a single Ollama tool call dict (as returned in message.tool_calls)."""
+    return {"function": {"name": name, "arguments": arguments}}
+
+
+def _make_ollama_tool_use_stream(
+    tool_calls: list[dict],
+    text_before: str = "",
+) -> list[dict]:
+    """Build an Ollama stream that yields optional text then tool_calls.
+
+    Ollama emits tool_calls in the final summary chunk.  The text chunks
+    come before it.
+    """
+    chunks: list[dict] = []
+    if text_before:
+        chunks.append({"message": {"content": text_before}})
+    # Summary chunk: content may be empty, tool_calls populated.
+    chunks.append({"message": {"content": "", "tool_calls": tool_calls}})
+    return chunks
+
+
+def _make_ollama_end_stream(*text_parts: str) -> list[dict]:
+    """Build an Ollama stream that yields text and no tool_calls."""
+    return [{"message": {"content": part}} for part in text_parts]
+
+
+def _make_ollama_mcp_client(
+    tools: list[ToolSpec] | None = None,
+    call_tool_return: ToolResult | None = None,
+    call_tool_side_effect: Exception | None = None,
+) -> MagicMock:
+    """Build a MagicMock that looks like an MCPClient for Ollama tests."""
+    mock = MagicMock()
+    mock.list_tools.return_value = tools or [
+        ToolSpec(name="kb_search", description="Search KB", input_schema={"type": "object"})
+    ]
+    if call_tool_side_effect is not None:
+        mock.call_tool.side_effect = call_tool_side_effect
+    else:
+        mock.call_tool.return_value = call_tool_return or ToolResult(
+            content="result", is_error=False
+        )
+    return mock
+
+
+# ---------------------------------------------------------------------------
+# Test: mcp_client=None → V2.10 fast path unchanged
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_respond_stream_without_mcp_client_unchanged():
+    """mcp_client=None → fast path: single chat call, no tools= arg."""
+    chunks = _make_ollama_end_stream("hello", " world")
+    mock_ollama = _make_ollama_client_mock(chunks)
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        result = list(client.respond_stream(context, conversation, mcp_client=None))
+
+    assert result == ["hello", " world"]
+    call_kwargs = mock_ollama.chat.call_args[1]
+    assert "tools" not in call_kwargs
+    mock_ollama.chat.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Test: tools= payload is passed when mcp_client is given
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_respond_stream_passes_tools_when_mcp_client_given():
+    """chat(..., tools=...) payload includes the translated tools from list_tools()."""
+    tool1 = ToolSpec(
+        name="kb_search",
+        description="Search KB",
+        input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+    tool2 = ToolSpec(name="kb_get", description="Get entry", input_schema={"type": "object"})
+
+    # End-of-turn stream (no tool_calls → loop returns after first iteration)
+    chunks = _make_ollama_end_stream("done")
+    mock_ollama = _make_ollama_client_mock(chunks)
+    mock_mcp = _make_ollama_mcp_client(tools=[tool1, tool2])
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Search for X"))
+        list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    call_kwargs = mock_ollama.chat.call_args[1]
+    assert "tools" in call_kwargs
+    tools = call_kwargs["tools"]
+    assert len(tools) == 2
+    names = {t["function"]["name"] for t in tools}
+    assert names == {"kb_search", "kb_get"}
+    # Verify full shape of first tool
+    assert tools[0]["type"] == "function"
+    fn = tools[0]["function"]
+    assert fn["description"] == tool1.description or fn["description"] == tool2.description
+
+
+# ---------------------------------------------------------------------------
+# Test: tool_calls → execute tool, append result, continue
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_respond_stream_executes_tool_use_and_continues():
+    """First stream emits tool_calls; call_tool is invoked; second stream yields text."""
+    tool_call = _make_ollama_tool_call("kb_search", {"query": "weather"})
+    stream1 = _make_ollama_tool_use_stream([tool_call], text_before="Let me check.")
+    stream2 = _make_ollama_end_stream("It is sunny.")
+
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = [iter(stream1), iter(stream2)]
+
+    mock_mcp = _make_ollama_mcp_client(
+        call_tool_return=ToolResult(content="sunny in Seattle", is_error=False)
+    )
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Weather?"))
+        result = list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    # Text before tool call + final text
+    assert "Let me check." in result
+    assert "It is sunny." in result
+
+    # call_tool invoked with correct name and args
+    mock_mcp.call_tool.assert_called_once_with("kb_search", {"query": "weather"})
+
+    # Two chat calls total
+    assert mock_ollama.chat.call_count == 2
+
+    # Second call's messages include: original + assistant (with tool_calls) + tool result
+    second_messages = mock_ollama.chat.call_args_list[1][1]["messages"]
+    roles = [m["role"] for m in second_messages]
+    assert "assistant" in roles
+    assert "tool" in roles
+    # Tool result message
+    tool_msg = next(m for m in second_messages if m["role"] == "tool")
+    assert tool_msg["name"] == "kb_search"
+    assert tool_msg["content"] == "sunny in Seattle"
+
+
+# ---------------------------------------------------------------------------
+# Test: parallel tool_calls (2 in one stream)
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_respond_stream_parallel_tool_use():
+    """Model emits 2 tool_calls in one stream; both call_tools fire; both tool messages appended."""
+    tc1 = _make_ollama_tool_call("kb_search", {"query": "A"})
+    tc2 = _make_ollama_tool_call("kb_get", {"id": "B"})
+    stream1 = _make_ollama_tool_use_stream([tc1, tc2])
+    stream2 = _make_ollama_end_stream("Combined result.")
+
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = [iter(stream1), iter(stream2)]
+
+    mock_mcp = _make_ollama_mcp_client()
+    mock_mcp.call_tool.side_effect = [
+        ToolResult(content="result A", is_error=False),
+        ToolResult(content="result B", is_error=False),
+    ]
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Query both"))
+        result = list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    assert result == ["Combined result."]
+    assert mock_mcp.call_tool.call_count == 2
+
+    # Second call messages should include 2 tool result messages
+    second_messages = mock_ollama.chat.call_args_list[1][1]["messages"]
+    tool_msgs = [m for m in second_messages if m["role"] == "tool"]
+    assert len(tool_msgs) == 2
+    tool_names = {m["name"] for m in tool_msgs}
+    assert tool_names == {"kb_search", "kb_get"}
+
+
+# ---------------------------------------------------------------------------
+# Test: MCPClientError → tool message with error content; loop continues
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_respond_stream_handles_mcp_client_error_as_tool_error():
+    """MCPClientError from call_tool → tool message with error text; stream continues."""
+    tc = _make_ollama_tool_call("kb_search", {"query": "X"})
+    stream1 = _make_ollama_tool_use_stream([tc])
+    stream2 = _make_ollama_end_stream("Sorry, I could not search.")
+
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = [iter(stream1), iter(stream2)]
+
+    mock_mcp = _make_ollama_mcp_client(call_tool_side_effect=MCPClientError("timeout"))
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Search X"))
+        result = list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    # Second turn text still yielded
+    assert "Sorry, I could not search." in result
+
+    # Tool message should contain the MCPClientError class name
+    second_messages = mock_ollama.chat.call_args_list[1][1]["messages"]
+    tool_msg = next(m for m in second_messages if m["role"] == "tool")
+    assert "MCPClientError" in tool_msg["content"]
+
+
+# ---------------------------------------------------------------------------
+# Test: iteration cap
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_respond_stream_caps_tool_iterations():
+    """Loop stops after MAX_TOOL_ITERATIONS and yields the sentinel string."""
+    from meeting_agent.llm import MAX_TOOL_ITERATIONS
+
+    tc = _make_ollama_tool_call("kb_search", {"query": "q"})
+    # Always return tool_calls — force the loop to cap.
+    streams = [iter(_make_ollama_tool_use_stream([tc])) for _ in range(MAX_TOOL_ITERATIONS + 2)]
+
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = streams
+
+    mock_mcp = _make_ollama_mcp_client()
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Go"))
+        result = list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    # Sentinel must be in the output
+    assert "(tool-use limit reached)" in result
+
+    # chat called exactly MAX_TOOL_ITERATIONS times
+    assert mock_ollama.chat.call_count == MAX_TOOL_ITERATIONS
+
+    # call_tool called once per iteration
+    assert mock_mcp.call_tool.call_count == MAX_TOOL_ITERATIONS
+
+
+# ---------------------------------------------------------------------------
+# Test: tracer.emit called with tool_invoked fields
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_respond_stream_emits_tool_invoked_trace():
+    """tracer.emit is called with tool_invoked and the expected fields."""
+    tc = _make_ollama_tool_call("kb_search", {"query": "test"})
+    stream1 = _make_ollama_tool_use_stream([tc])
+    stream2 = _make_ollama_end_stream("Here you go.")
+
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = [iter(stream1), iter(stream2)]
+
+    mock_mcp = _make_ollama_mcp_client(
+        call_tool_return=ToolResult(content="found it", is_error=False)
+    )
+    mock_tracer = MagicMock(spec=Tracer)
+    mock_tracer.enabled = True
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Search"))
+        list(client.respond_stream(context, conversation, mcp_client=mock_mcp, tracer=mock_tracer))
+
+    emit_calls = mock_tracer.emit.call_args_list
+    tool_invoked_calls = [c for c in emit_calls if c[0][0] == "tool_invoked"]
+    assert len(tool_invoked_calls) == 1
+
+    _, kwargs = tool_invoked_calls[0]
+    assert kwargs["tool_name"] == "kb_search"
+    assert "query" in kwargs["arguments_preview"]
+    assert kwargs["result_bytes"] == len(b"found it")
+    assert kwargs["is_error"] is False
+    assert "duration_s" in kwargs
+
+
+# ---------------------------------------------------------------------------
+# Test: non-MCPClientError re-raises (circuit breaker)
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_respond_stream_reraises_unexpected_tool_exception():
+    """Non-MCPClientError exception in call_tool propagates (for circuit breaker)."""
+    tc = _make_ollama_tool_call("kb_search", {})
+    stream1 = _make_ollama_tool_use_stream([tc])
+
+    mock_ollama = MagicMock()
+    mock_ollama.chat.return_value = iter(stream1)
+
+    mock_mcp = _make_ollama_mcp_client(call_tool_side_effect=RuntimeError("unexpected"))
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="hi"))
+        with pytest.raises(RuntimeError, match="unexpected"):
+            list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+
+# ---------------------------------------------------------------------------
+# Test: _mcp_tools_to_ollama_tools pure function
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_tools_to_ollama_tools_translates_correctly():
+    """_mcp_tools_to_ollama_tools maps ToolSpec fields to Ollama function format."""
+    tools = [
+        ToolSpec(
+            name="kb_search",
+            description="Search the knowledge base",
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        ),
+        ToolSpec(
+            name="kb_get",
+            description="Get an entry",
+            input_schema={"type": "object"},
+        ),
+    ]
+    result = _mcp_tools_to_ollama_tools(tools)
+
+    assert len(result) == 2
+
+    t0 = result[0]
+    assert t0["type"] == "function"
+    assert t0["function"]["name"] == "kb_search"
+    assert t0["function"]["description"] == "Search the knowledge base"
+    assert t0["function"]["parameters"] == {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    }
+
+    t1 = result[1]
+    assert t1["type"] == "function"
+    assert t1["function"]["name"] == "kb_get"
+    assert t1["function"]["description"] == "Get an entry"
+    assert t1["function"]["parameters"] == {"type": "object"}
+
+
+# ---------------------------------------------------------------------------
+# Test: no warning when mcp_client is given (V3.0.3 stub warning removed)
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_respond_stream_no_warning_when_mcp_client_given(caplog):
+    """The V3.0.3 'ignoring MCP client' warning is gone — no log on the Ollama path."""
+    tc = _make_ollama_tool_call("kb_search", {"query": "x"})
+    stream1 = _make_ollama_tool_use_stream([tc])
+    stream2 = _make_ollama_end_stream("done")
+
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = [iter(stream1), iter(stream2)]
+
+    mock_mcp = _make_ollama_mcp_client()
+
+    with (
+        patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama),
+        caplog.at_level(logging.WARNING, logger="meeting_agent.llm"),
+    ):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="hello"))
+        list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    # No warning mentioning "not supported" or "ignoring"
+    warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not any("not supported" in m.lower() or "ignoring" in m.lower() for m in warning_msgs), (
+        f"Unexpected warning found: {warning_msgs}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test: string arguments fallback (Ollama older version compatibility)
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_respond_stream_handles_string_tool_arguments():
+    """When tool arguments come as a JSON string, they are parsed to a dict."""
+    # Simulate an Ollama version that returns arguments as a JSON string
+    tc_with_string_args = {"function": {"name": "kb_search", "arguments": '{"query": "x"}'}}
+    stream1 = [{"message": {"content": "", "tool_calls": [tc_with_string_args]}}]
+    stream2 = _make_ollama_end_stream("found it")
+
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = [iter(stream1), iter(stream2)]
+
+    mock_mcp = _make_ollama_mcp_client()
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="hi"))
+        result = list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    assert "found it" in result
+    # call_tool should receive a dict, not a string
+    mock_mcp.call_tool.assert_called_once_with("kb_search", {"query": "x"})
+
+
+def test_ollama_respond_stream_handles_malformed_string_tool_arguments(caplog):
+    """Malformed JSON string in tool arguments falls back to empty dict."""
+    tc_bad = {"function": {"name": "kb_search", "arguments": "not-json{"}}
+    stream1 = [{"message": {"content": "", "tool_calls": [tc_bad]}}]
+    stream2 = _make_ollama_end_stream("ok")
+
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = [iter(stream1), iter(stream2)]
+
+    mock_mcp = _make_ollama_mcp_client()
+
+    with (
+        patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama),
+        caplog.at_level(logging.WARNING, logger="meeting_agent.llm"),
+    ):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="hi"))
+        list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    # call_tool invoked with empty dict fallback
+    mock_mcp.call_tool.assert_called_once_with("kb_search", {})
+    # Warning should be logged
+    assert any("parse" in r.message.lower() for r in caplog.records)
+
+
+def test_ollama_respond_stream_tool_error_with_empty_content():
+    """ToolResult with is_error=True and empty content gets default error message."""
+    tc = _make_ollama_tool_call("kb_search", {})
+    stream1 = _make_ollama_tool_use_stream([tc])
+    stream2 = _make_ollama_end_stream("done")
+
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = [iter(stream1), iter(stream2)]
+
+    mock_mcp = _make_ollama_mcp_client(call_tool_return=ToolResult(content="", is_error=True))
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="hi"))
+        list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    second_messages = mock_ollama.chat.call_args_list[1][1]["messages"]
+    tool_msg = next(m for m in second_messages if m["role"] == "tool")
+    assert tool_msg["content"] == "tool returned an error with no content"
+
+
+def test_ollama_respond_stream_tool_iteration_cap_emits_trace():
+    """When iteration cap hits with a tracer, tool_iteration_cap_hit event fires."""
+    from meeting_agent.llm import MAX_TOOL_ITERATIONS
+
+    tc = _make_ollama_tool_call("kb_search", {})
+    streams = [iter(_make_ollama_tool_use_stream([tc])) for _ in range(MAX_TOOL_ITERATIONS + 2)]
+
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = streams
+
+    mock_mcp = _make_ollama_mcp_client(call_tool_return=ToolResult(content="r", is_error=False))
+    mock_tracer = MagicMock()
+
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="x")
+        conv = Conversation(latest_turn=Turn(speaker="Jason", text="hi"))
+        list(client.respond_stream(context, conv, mcp_client=mock_mcp, tracer=mock_tracer))
+
+    event_names = [call.args[0] for call in mock_tracer.emit.call_args_list]
+    assert "tool_iteration_cap_hit" in event_names
+
+
+def test_ollama_respond_stream_reraises_chat_exception_in_mcp_loop(caplog):
+    """chat() raising in the MCP loop path logs a warning and re-raises."""
+    mock_ollama = MagicMock()
+    mock_ollama.chat.side_effect = ConnectionError("daemon down")
+
+    mock_mcp = _make_ollama_mcp_client()
+
+    with (
+        patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama),
+        caplog.at_level(logging.WARNING, logger="meeting_agent.llm"),
+    ):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="Be helpful.")
+        conversation = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        with pytest.raises(ConnectionError):
+            list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
+
+    assert any("respond_stream failed" in r.message for r in caplog.records)

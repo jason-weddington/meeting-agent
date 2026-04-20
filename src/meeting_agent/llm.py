@@ -140,6 +140,30 @@ def _build_messages(conversation: Conversation) -> list[dict[str, Any]]:
     return messages
 
 
+def _mcp_tools_to_ollama_tools(tools: Sequence[ToolSpec]) -> list[dict[str, Any]]:
+    """Translate MCP ToolSpec list → Ollama-format tools list (OpenAI-style).
+
+    Args:
+        tools: List of :class:`~meeting_agent.mcp_client.ToolSpec` descriptors
+            returned by ``MCPClient.list_tools()``.
+
+    Returns:
+        A list of tool dicts in the OpenAI function-calling format expected by
+        ``ollama.Client.chat(tools=...)``.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.input_schema,
+            },
+        }
+        for t in tools
+    ]
+
+
 def _mcp_tools_to_bedrock_toolconfig(tools: Sequence[ToolSpec]) -> dict[str, Any]:
     """Translate MCP ToolSpec list into Bedrock converse_stream toolConfig.
 
@@ -588,8 +612,9 @@ class OllamaClient:
     disables Qwen3's hybrid-reasoner thinking mode so the model returns plain
     text deltas rather than ``<think>`` blocks.
 
-    Note: Ollama tool use is deferred to a future story (post-V3.0).  See
-    roadmap.
+    Supports MCP tool-use grounding (V3.0.5): when ``mcp_client`` is supplied,
+    the model receives the tool list via Ollama's native ``tools=`` parameter
+    and the tool-use loop runs identically to :class:`BedrockClient`.
     """
 
     DEFAULT_MODEL: str = "qwen3.6:35b-a3b-mlx-bf16"
@@ -618,7 +643,6 @@ class OllamaClient:
         self.host = host or os.environ.get("OLLAMA_HOST") or self.DEFAULT_HOST
         self.timeout_s = timeout_s
         self._client: ollama.Client | None = None
-        self._mcp_warning_issued: bool = False  # one-time warning guard
 
     def _get_client(self) -> ollama.Client:
         """Return the Ollama client, creating it if needed."""
@@ -669,16 +693,25 @@ class OllamaClient:
           other speaker names map to ``role: "user"`` with speaker prefixes.
           Consecutive non-agent turns are collapsed into a single user message.
 
-        Note: Ollama tool-use is not yet supported (post-V3.0 roadmap item).
-        ``mcp_client`` and ``tracer`` are accepted for protocol uniformity but
-        ``mcp_client`` is silently ignored after logging a one-time warning.
-        Use ``--llm-backend bedrock`` to enable KB grounding.
+        When ``mcp_client`` is ``None`` the method behaves exactly as it did
+        before V3.0.5 — a single ``chat`` call with no tools.
+
+        When ``mcp_client`` is supplied the method runs the MCP tool-use loop:
+
+        1. Fetches the server's tool list and builds an Ollama ``tools=`` payload.
+        2. Streams text deltas, yielding them as they arrive.
+        3. On any tool_calls in the stream, executes each via MCPClient, appends
+           tool result messages, and restarts the stream.
+        4. Loops until no tool_calls or the :data:`MAX_TOOL_ITERATIONS` cap.
 
         Args:
             context: Stable per-meeting context (system prompt, agenda, etc.).
             conversation: Rolling transcript.  ``latest_turn`` must be set.
-            mcp_client: Accepted for protocol uniformity; ignored by Ollama.
-            tracer: Accepted for protocol uniformity; unused by Ollama.
+            mcp_client: Optional MCP client for KB grounding.  When ``None``,
+                the fast path is used (single stream, no tools).
+            tracer: Optional structured trace emitter.  Emits ``tool_invoked``
+                and ``tool_iteration_cap_hit`` events (same shape as
+                :class:`BedrockClient`).
 
         Raises:
             ValueError: If ``conversation.latest_turn`` is ``None``.
@@ -686,13 +719,6 @@ class OllamaClient:
             Exception: Re-raises any Ollama client error so the pipeline's
                 circuit breaker can observe the failure.
         """
-        if mcp_client is not None and not self._mcp_warning_issued:
-            _logger.warning(
-                "OllamaClient: Ollama tool-use not supported; ignoring MCP client. "
-                "Use --llm-backend bedrock for KB grounding."
-            )
-            self._mcp_warning_issued = True
-
         if conversation.latest_turn is None:
             raise ValueError("Conversation.latest_turn must be set")
         if conversation.latest_turn.speaker == "agent":
@@ -702,18 +728,138 @@ class OllamaClient:
             )
 
         messages = _build_ollama_messages(conversation, context)
-        try:
-            stream = self._get_client().chat(
-                model=self.model,
-                messages=messages,
-                think=False,  # Qwen3 hybrid-reasoner guard — prevents <think> blocks
-                stream=True,
-                options={"temperature": 0.7, "num_predict": 1024},
-            )
+
+        # ------------------------------------------------------------------
+        # Fast path: no MCP client — single stream, no tools.
+        # Behaviour is identical to pre-V3.0.5.
+        # ------------------------------------------------------------------
+        if mcp_client is None:
+            try:
+                stream = self._get_client().chat(
+                    model=self.model,
+                    messages=messages,
+                    think=False,  # Qwen3 hybrid-reasoner guard — prevents <think> blocks
+                    stream=True,
+                    options={"temperature": 0.7, "num_predict": 1024},
+                )
+                for chunk in stream:
+                    delta = chunk.get("message", {}).get("content", "")
+                    if delta:
+                        yield delta
+            except Exception:
+                _logger.warning("OllamaClient.respond_stream failed.", exc_info=True)
+                raise
+            return
+
+        # ------------------------------------------------------------------
+        # MCP tool-use loop
+        # ------------------------------------------------------------------
+        tools_payload = _mcp_tools_to_ollama_tools(mcp_client.list_tools())
+
+        for _iteration in range(MAX_TOOL_ITERATIONS):
+            accumulated_text = ""
+            tool_calls: list[dict[str, Any]] = []
+
+            try:
+                stream = self._get_client().chat(
+                    model=self.model,
+                    messages=messages,
+                    tools=tools_payload,
+                    think=False,  # Qwen3 hybrid-reasoner guard
+                    stream=True,
+                    options={"temperature": 0.7, "num_predict": 1024},
+                )
+            except Exception:
+                _logger.warning("OllamaClient.respond_stream failed.", exc_info=True)
+                raise
+
             for chunk in stream:
-                delta = chunk.get("message", {}).get("content", "")
+                msg = chunk.get("message", {})
+                delta = msg.get("content", "")
                 if delta:
                     yield delta
-        except Exception:
-            _logger.warning("OllamaClient.respond_stream failed.", exc_info=True)
-            raise
+                    accumulated_text += delta
+                chunk_tool_calls = msg.get("tool_calls")
+                if chunk_tool_calls:
+                    # Ollama returns tool_calls as a list on whichever chunk the
+                    # model emitted them.  Accumulate across chunks defensively.
+                    tool_calls.extend(chunk_tool_calls)
+
+            if not tool_calls:
+                return  # model finished normally — no tool calls
+
+            # Build assistant message reflecting what the model just produced.
+            assistant_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": accumulated_text,
+                "tool_calls": tool_calls,
+            }
+            messages.append(assistant_msg)
+
+            # Execute each tool call and append tool result messages.
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                raw_args = fn.get("arguments", {})
+                # Ollama 0.6.x returns arguments as a dict; older versions may
+                # return a JSON string.  Handle both defensively.
+                if isinstance(raw_args, str):
+                    try:
+                        args: dict[str, Any] = json.loads(raw_args)
+                    except (json.JSONDecodeError, ValueError):
+                        _logger.warning(
+                            "Failed to parse tool arguments JSON for tool %r; using empty dict.",
+                            name,
+                        )
+                        args = {}
+                else:
+                    args = raw_args
+
+                t0 = time.monotonic()
+                is_error = False
+                result_text = ""
+
+                try:
+                    tr = mcp_client.call_tool(name, args)
+                    duration_s = time.monotonic() - t0
+                    is_error = tr.is_error
+                    result_text = tr.content or (
+                        "tool returned an error with no content" if is_error else ""
+                    )
+                except MCPClientError as exc:
+                    duration_s = time.monotonic() - t0
+                    is_error = True
+                    result_text = f"MCP client error: {type(exc).__name__}"
+                    _logger.warning("MCPClientError calling tool %r: %s", name, exc)
+                except Exception:
+                    _logger.exception("Unexpected error calling tool %r; aborting.", name)
+                    raise
+
+                if tracer is not None:
+                    tracer.emit(
+                        "tool_invoked",
+                        tool_name=name,
+                        arguments_preview=json.dumps(args)[:200],
+                        duration_s=duration_s,
+                        result_bytes=len(result_text.encode()),
+                        is_error=is_error,
+                    )
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "name": name,
+                        "content": result_text,
+                    }
+                )
+
+        # ------------------------------------------------------------------
+        # Iteration cap reached without the model finishing cleanly.
+        # ------------------------------------------------------------------
+        _logger.warning(
+            "Tool-use iteration cap hit after %d iterations; stopping.",
+            MAX_TOOL_ITERATIONS,
+        )
+        if tracer is not None:
+            tracer.emit("tool_iteration_cap_hit", iterations=MAX_TOOL_ITERATIONS)
+        yield "(tool-use limit reached)"

@@ -1554,64 +1554,29 @@ def test_pipeline_handles_mcp_stop_exception_on_startup_failure():
 
 
 # ---------------------------------------------------------------------------
-# OllamaClient MCP warning test (V3.0.3)
+# Pipeline: mcp_client reaches OllamaClient (V3.0.5)
 # ---------------------------------------------------------------------------
 
 
-def test_ollama_llm_logs_warning_when_mcp_client_supplied(caplog):
-    """OllamaClient.respond_stream logs a one-time warning when mcp_client is supplied."""
-    from meeting_agent.llm import Conversation, OllamaClient, ProjectContext, Turn
+def test_pipeline_passes_mcp_client_to_ollama_llm():
+    """Full pipeline with llm_backend=ollama + mcp_server: mcp_client reaches respond_stream."""
+    from meeting_agent.mcp_client import MCPServerConfig
 
-    mock_mcp = MagicMock()
-
-    ollama_client = OllamaClient()
-
-    # Mock the Ollama HTTP client to return a single token.
-    mock_ollama_http = MagicMock()
-    mock_ollama_http.chat.return_value = iter([{"message": {"content": "hi"}}])
-
-    conversation = Conversation(
-        older_turns=[],
-        latest_turn=Turn(speaker="Jason", text="hello"),
+    utterance = _make_utterance("What's in the KB?")
+    mock_asr, mock_classifier, mock_llm, mock_tts = _make_v2_mocks(
+        utterances=[utterance],
+        decisions=[_full_answer_decision()],
+        lm_deltas=["KB result."],
     )
-    context = ProjectContext(system_prompt="test")
+    mock_mcp = _make_mcp_mocks()
 
-    with (
-        patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama_http),
-        caplog.at_level(logging.WARNING, logger="meeting_agent.llm"),
-    ):
-        # First call — should log the warning.
-        list(ollama_client.respond_stream(context, conversation, mcp_client=mock_mcp))
-
-    assert any("not supported" in r.message.lower() for r in caplog.records), (
-        f"Expected 'not supported' in warning, got: {[r.message for r in caplog.records]}"
+    config = PipelineConfig(
+        llm_backend="ollama",
+        mcp_server=MCPServerConfig(command="uv", args=("run", "personal-kb-mcp")),
     )
+    _run_pipeline_with_mcp(mock_asr, mock_classifier, mock_llm, mock_tts, mock_mcp, config)
 
-
-def test_ollama_llm_warning_issued_only_once(caplog):
-    """OllamaClient.respond_stream logs the MCP warning only once per instance."""
-    from meeting_agent.llm import Conversation, OllamaClient, ProjectContext, Turn
-
-    mock_mcp = MagicMock()
-    ollama_client = OllamaClient()
-    mock_ollama_http = MagicMock()
-    mock_ollama_http.chat.return_value = iter([{"message": {"content": "hi"}}])
-
-    conversation = Conversation(
-        older_turns=[],
-        latest_turn=Turn(speaker="Jason", text="hello"),
-    )
-    context = ProjectContext(system_prompt="test")
-
-    with (
-        patch("meeting_agent.llm.ollama.Client", return_value=mock_ollama_http),
-        caplog.at_level(logging.WARNING, logger="meeting_agent.llm"),
-    ):
-        # Two calls with mcp_client — warning should appear only once.
-        mock_ollama_http.chat.return_value = iter([{"message": {"content": "hi"}}])
-        list(ollama_client.respond_stream(context, conversation, mcp_client=mock_mcp))
-        mock_ollama_http.chat.return_value = iter([{"message": {"content": "hi"}}])
-        list(ollama_client.respond_stream(context, conversation, mcp_client=mock_mcp))
-
-    mcp_warnings = [r for r in caplog.records if "not supported" in r.message.lower()]
-    assert len(mcp_warnings) == 1, f"Expected exactly 1 warning, got {len(mcp_warnings)}"
+    assert mock_llm.respond_stream.called
+    call_kwargs = mock_llm.respond_stream.call_args.kwargs
+    # The mcp_client kwarg must be the mock MCPClient instance (not None).
+    assert call_kwargs.get("mcp_client") is mock_mcp
