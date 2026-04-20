@@ -208,10 +208,21 @@ Return a JSON object with three fields:
    clarification. Clarifying questions are the response LLM's job, not yours.
    Your choice is only: respond at all (hedged/full) or don't (silent).
 
-3. Audio-failure repair is NOT the agent's job at any layer. If the transcript
-   looks garbled or the ASR confidence is low (see avg_logprob / no_speech_prob
-   in the user prompt), return "silent". Do NOT return "hedged_answer" with the
-   intent of asking the human to repeat themselves.
+3. Audio-failure repair is about direction. The agent must not ask humans to
+   repeat themselves, and must not respond to its own ASR hallucinations.
+   But humans asking the agent to repeat or clarify is a legitimate meeting
+   contribution and should be handled like any other addressed question.
+
+   - Transcript looks garbled OR ASR confidence is poor (avg_logprob below
+     about -1.0, no_speech_prob above 0.6, or compression_ratio above 2.4):
+     return "silent". The agent should never react to noise.
+   - Agent is asking the human to repeat ("sorry, can you repeat?",
+     "I didn't catch that"): the response LLM is never supposed to produce
+     this, so it should not appear; if it somehow does, return "silent".
+   - Human is asking the agent to repeat or rephrase ("can you say that
+     again?", "what did you just say?", "I didn't hear you"): return
+     "full_answer". The response LLM will re-state or rephrase its prior
+     turn using the rolling transcript.
 
 4. Airtime budget: if `agent_turns_last_30s > 0` or `agent_turns_last_5min > 3`,
    raise your bar for speaking by one level. Prefer "silent" over "hedged"; prefer

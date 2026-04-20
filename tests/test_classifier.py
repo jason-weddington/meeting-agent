@@ -165,6 +165,26 @@ def test_system_prompt_embeds_project_context():
     assert system_prompt in system[0]["text"]
 
 
+def test_system_prompt_distinguishes_repeat_request_direction():
+    """Rule #3 explicitly permits user-asking-agent-to-repeat as full_answer.
+
+    Locks in the V0.10.2 prompt fix: humans asking the agent to repeat or
+    rephrase must be treated as a legitimate meeting contribution, not
+    silenced as 'audio-failure repair'.
+    """
+    mock_client = MagicMock()
+    mock_client.converse.return_value = _make_classify_response("Jason", "silent", 0.5)
+    with patch("boto3.client", return_value=mock_client):
+        classifier = BedrockClassifier()
+        classifier.classify(_make_utterance(), _make_confidence(), _make_context(), _make_session())
+
+    system_text = mock_client.converse.call_args[1]["system"][0]["text"]
+    # The phrasing matters — if these sentinel strings disappear, the classifier
+    # will regress to silencing user repeat requests.
+    assert "Human is asking the agent to repeat" in system_text
+    assert 'return\n     "full_answer"' in system_text or 'return "full_answer"' in system_text
+
+
 # ---------------------------------------------------------------------------
 # BedrockClassifier: response parsing tests
 # ---------------------------------------------------------------------------

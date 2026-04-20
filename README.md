@@ -63,7 +63,7 @@ The north-star agent has:
 - Mid-meeting tool use: look up docs, check prior decisions, query the decision log
 - Proactive contribution mode (speak up when confidence is high, stay quiet otherwise)
 
-## Quick start (V1 dev)
+## Quick start
 
 Requires macOS on Apple Silicon, Python 3.13, and microphone/speaker permission for your terminal.
 
@@ -73,13 +73,41 @@ git clone git@github.com:jason-weddington/meeting-agent.git
 cd meeting-agent
 uv sync
 
-# Run the latency smoke test to verify your machine is fast enough
+# Optional: latency smoke tests to verify your machine is fast enough
 uv run python scripts/latency_check.py tts
 uv run python scripts/latency_check.py asr --seconds 5
-
-# (V1 CLI — coming soon)
-# uv run meeting-agent run
 ```
+
+### Running the agent
+
+The default configuration is Bedrock Claude Sonnet for responses, Bedrock Claude Haiku for the classifier. AWS credentials need to be active (the `bedrock-runtime` service).
+
+```bash
+# Minimal: default models, no KB grounding
+uv run meeting-agent --trace --verbose
+
+# Grounded: give the agent an MCP server it can query mid-response
+uv run meeting-agent --kb-mcp ~/scripts/personal-kb.sh --trace --verbose
+```
+
+`--trace` writes JSONL events to `~/.meeting-agent/trace.jsonl` (decisions, tool calls, latencies). `--verbose` also tees a one-line summary per event to stderr while the agent runs.
+
+### Fully-local mode
+
+Swap Bedrock out for a local Ollama daemon on both tiers. No AWS, no network egress beyond the MCP server you point at. Requires an Ollama install with a tool-calling-capable model pulled (default: `qwen3.6:35b-a3b-mlx-bf16`).
+
+```bash
+# Fully local: classifier + response + KB grounding all on-device
+uv run meeting-agent \
+    --classifier-backend ollama \
+    --llm-backend ollama \
+    --kb-mcp ~/scripts/personal-kb.sh \
+    --trace --verbose
+```
+
+First invocation cold-loads the model (20–30s for a 35B MoE). Subsequent runs re-use Ollama's resident model via `keep_alive` (default 5 min).
+
+The `--kb-mcp` flag takes the full command string to launch a stdio MCP server. A wrapper script like `~/scripts/personal-kb.sh` is the ergonomic way to keep the command out of the flag. The meeting-agent spawns the server as a subprocess, speaks JSON-RPC over stdin/stdout, and terminates it on shutdown. Shell-exported environment variables (e.g. `KB_DATABASE_URL`) are inherited by the MCP subprocess.
 
 ## Design notes and prior art
 
