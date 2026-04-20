@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.10.1 (2026-04-20)
+
+### Bug Fixes
+
+- **mcp**: Inherit parent env for subprocess by default
+  ([`afd0fef`](https://github.com/repos/meeting-agent/commit/afd0fef4e075c5da187c3b4bc3a70b8a376dcef5))
+
+
 ## v0.10.0 (2026-04-19)
 
 ### Bug Fixes
