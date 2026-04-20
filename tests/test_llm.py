@@ -1873,3 +1873,76 @@ def test_ollama_respond_stream_reraises_chat_exception_in_mcp_loop(caplog):
             list(client.respond_stream(context, conversation, mcp_client=mock_mcp))
 
     assert any("respond_stream failed" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Tool-narration guardrail (0.10.3): appended to system_text only when an
+# MCP client is wired up. Prevents dead-air during tool calls without
+# touching the ungrounded path.
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_respond_stream_appends_narration_guardrail_when_mcp_given():
+    """BedrockClient system_text includes the narration guardrail under tool use."""
+    turn = _make_end_turn_stream("ok")
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.return_value = turn
+    mock_mcp = _make_mcp_client()
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="You are a meeting participant.")
+        conv = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        list(client.respond_stream(context, conv, mcp_client=mock_mcp))
+
+    system_text = mock_bedrock.converse_stream.call_args[1]["system"][0]["text"]
+    assert "narrate briefly" in system_text
+    assert "phone-support agent" in system_text
+
+
+def test_bedrock_respond_stream_no_narration_guardrail_in_fast_path():
+    """Ungrounded BedrockClient calls (mcp_client=None) omit the narration guardrail."""
+    turn = _make_end_turn_stream("ok")
+    mock_bedrock = MagicMock()
+    mock_bedrock.converse_stream.return_value = turn
+    with patch("boto3.client", return_value=mock_bedrock):
+        client = BedrockClient()
+        context = ProjectContext(system_prompt="You are a meeting participant.")
+        conv = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        list(client.respond_stream(context, conv))
+
+    system_text = mock_bedrock.converse_stream.call_args[1]["system"][0]["text"]
+    assert "narrate briefly" not in system_text
+
+
+def test_ollama_respond_stream_appends_narration_guardrail_when_mcp_given():
+    """OllamaClient system message includes the narration guardrail under tool use."""
+    mock_client = MagicMock()
+    mock_client.chat.return_value = iter(
+        [{"message": {"content": "ok", "tool_calls": []}, "done": True}]
+    )
+    mock_mcp = _make_mcp_client()
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_client):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="You are a meeting participant.")
+        conv = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        list(client.respond_stream(context, conv, mcp_client=mock_mcp))
+
+    messages = mock_client.chat.call_args[1]["messages"]
+    system_msg = next(m for m in messages if m["role"] == "system")
+    assert "narrate briefly" in system_msg["content"]
+    assert "phone-support agent" in system_msg["content"]
+
+
+def test_ollama_respond_stream_no_narration_guardrail_in_fast_path():
+    """Ungrounded OllamaClient calls (mcp_client=None) omit the narration guardrail."""
+    mock_client = MagicMock()
+    mock_client.chat.return_value = iter([{"message": {"content": "ok"}, "done": True}])
+    with patch("meeting_agent.llm.ollama.Client", return_value=mock_client):
+        client = OllamaClient()
+        context = ProjectContext(system_prompt="You are a meeting participant.")
+        conv = Conversation(latest_turn=Turn(speaker="Jason", text="Hi"))
+        list(client.respond_stream(context, conv))
+
+    messages = mock_client.chat.call_args[1]["messages"]
+    system_msg = next(m for m in messages if m["role"] == "system")
+    assert "narrate briefly" not in system_msg["content"]

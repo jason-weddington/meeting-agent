@@ -36,6 +36,21 @@ _logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS: int = 5
 
+# Appended to the response-LLM system prompt only when an MCPClient is wired
+# up (i.e. the model can emit tool_use blocks).  Stops dead-air while tool
+# calls run.  Kept short so it doesn't dilute the main persona prompt.
+_TOOL_NARRATION_GUARDRAIL: str = """
+
+When you use tools to look something up during your response, narrate briefly
+so the listener doesn't hear dead air. Before you call a tool, say what you're
+about to do in one short phrase — for example "let me check the knowledge
+base, one second" or "I'll look that up". If you need another tool after the
+first, a brief transition works — "found some entries, reading now". A short
+lead-in before your final answer is fine — "okay, here's what I found". Think
+of a good phone-support agent who narrates each step so the caller knows the
+line hasn't dropped. Do not over-explain; one short sentence per step is plenty.
+"""
+
 
 def _log_cache_hit(logger: logging.Logger, call: str, usage: dict[str, Any]) -> None:
     """Log a human-readable cache-hit summary when total input tokens > 0."""
@@ -314,6 +329,8 @@ class BedrockClient:
                 ],
             )
         )
+        if mcp_client is not None:
+            system_text = system_text + _TOOL_NARRATION_GUARDRAIL
 
         messages = _build_messages(conversation)
 
@@ -539,6 +556,7 @@ class BedrockClient:
 def _build_ollama_messages(
     conversation: Conversation,
     context: ProjectContext,
+    system_suffix: str = "",
 ) -> list[dict[str, Any]]:
     """Build OpenAI-style chat messages from the conversation for Ollama.
 
@@ -557,6 +575,9 @@ def _build_ollama_messages(
     Args:
         conversation: Rolling transcript.  ``latest_turn`` must already be set.
         context: Stable per-meeting context used to build the system message.
+        system_suffix: Optional text appended to the system message after
+            the context fields.  Used by the caller to inject the tool-use
+            narration guardrail when an MCP client is in play.
 
     Returns:
         A list of ``{"role": ..., "content": ...}`` dicts suitable for
@@ -578,6 +599,8 @@ def _build_ollama_messages(
             ],
         )
     )
+    if system_suffix:
+        system_text = system_text + system_suffix
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_text}]
     buffer: list[str] = []
@@ -727,7 +750,8 @@ class OllamaClient:
                 f"got {conversation.latest_turn.speaker!r}"
             )
 
-        messages = _build_ollama_messages(conversation, context)
+        system_suffix = _TOOL_NARRATION_GUARDRAIL if mcp_client is not None else ""
+        messages = _build_ollama_messages(conversation, context, system_suffix=system_suffix)
 
         # ------------------------------------------------------------------
         # Fast path: no MCP client — single stream, no tools.
