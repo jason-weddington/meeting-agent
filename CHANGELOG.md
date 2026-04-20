@@ -2,6 +2,79 @@
 
 <!-- version list -->
 
+## v0.10.0 (2026-04-19)
+
+### Bug Fixes
+
+- **ollama**: Disable thinking + make shared prompt backend-neutral
+  ([`1cf3179`](https://github.com/repos/meeting-agent/commit/1cf31796a9f250239501a9b5d516e0ac3e4d9929))
+
+- **ollama**: Pre-warm model and bump timeout to 60s to survive cold-load
+  ([`9210699`](https://github.com/repos/meeting-agent/commit/921069968285df2914d7ec0431e24fcba68c596d))
+
+- **pipeline**: Silence-flush TTS output + extend echo drain window
+  ([`6729c1e`](https://github.com/repos/meeting-agent/commit/6729c1eb7c026aa663c5963161b9420f058c2c4d))
+
+### Chores
+
+- Retire wake.py and openwakeword dependency
+  ([`a83fb4e`](https://github.com/repos/meeting-agent/commit/a83fb4e1270895b7489467cdf1087f5fdaca450d))
+
+- **ollama**: Default to qwen3.6:35b-a3b-mlx-bf16
+  ([`07aea8a`](https://github.com/repos/meeting-agent/commit/07aea8a35a35dfd1262d4f712c7c73081f89301b))
+
+### Features
+
+- **classifier**: Haiku 4.5 gatekeeper — silent / hedged_answer / full_answer
+  ([`ae21b3c`](https://github.com/repos/meeting-agent/commit/ae21b3cdae14228525d72a5ef9376a169b85f138))
+
+- **classifier**: Local Ollama backend with configurable model (V2.9)
+  ([`5fe2cb9`](https://github.com/repos/meeting-agent/commit/5fe2cb9c2320ffc7830b9649b30595ee9a907bc0))
+
+- **context**: Markdown directory loader for Living Context Pattern
+  ([`89100e4`](https://github.com/repos/meeting-agent/commit/89100e4e1cec770c8182543443d168678a0b0721))
+
+- **llm**: Bedrock tool-use loop via MCP client (V3.0.2)
+  ([`f883750`](https://github.com/repos/meeting-agent/commit/f8837504c165ccc64d2ec02626033ab087928a25))
+
+- **llm**: Local Ollama response-LLM backend (configurable model, Bedrock default)
+  ([`1eaee66`](https://github.com/repos/meeting-agent/commit/1eaee6655020786531947a92ee8c40063323c6a0))
+
+- **llm**: Ollama tool-use loop via MCP client (V3.0.5)
+  ([`8a9308d`](https://github.com/repos/meeting-agent/commit/8a9308d2fae2e53f61d791483e37c568adce466d))
+
+- **mcp**: Add MCPClient stdio foundation (V3.0.1)
+  ([`60a7223`](https://github.com/repos/meeting-agent/commit/60a72237d0d5ffd7338d96b590c211a3ad889e1d))
+
+- **mcp**: End-to-end integration test + smoke-test docs (V3.0.4)
+  ([`21b80b0`](https://github.com/repos/meeting-agent/commit/21b80b0685e0eddce38baae9786151a37fa7f5ed))
+
+- **observability**: Dev-mode trace log — classifier decisions, pipeline events, latency
+  ([`75ca09d`](https://github.com/repos/meeting-agent/commit/75ca09df620ae9a867f5319061f9c84330700504))
+
+- **observability**: Surface Bedrock cache-hit telemetry for classifier + response LLM
+  ([`0080740`](https://github.com/repos/meeting-agent/commit/0080740b5ac77d8dd51e8738cd604ea7e3b9bdcf))
+
+- **pipeline**: Always-on classifier-gated V2 pipeline with lossy-aware scaffolding
+  ([`51e20b5`](https://github.com/repos/meeting-agent/commit/51e20b591a8c2c7e75da56c746917b959adb54e9))
+
+- **pipeline**: TTS post-filter strips markdown symbols before synthesis
+  ([`c35e4de`](https://github.com/repos/meeting-agent/commit/c35e4dec8f08bd51bdbdd4a7281d30806b3ce938))
+
+- **pipeline**: Wire MCP client + --kb-mcp CLI flag (V3.0.3)
+  ([`7281f81`](https://github.com/repos/meeting-agent/commit/7281f810808a94ae526a9a1387c704bf3c99da8a))
+
+### Refactoring
+
+- **llm**: Switch from flat-text transcript to native multi-turn messages
+  ([`299dcd1`](https://github.com/repos/meeting-agent/commit/299dcd1670addee7983038774c4e92e4e5446c89))
+
+### Testing
+
+- **integration**: End-to-end test for V2 classifier-gated pipeline
+  ([`0378c12`](https://github.com/repos/meeting-agent/commit/0378c126083ab8fa2dba360d7bdae6ff218ff262))
+
+
 ## v0.9.4 (2026-04-17)
 
 ### Bug Fixes
