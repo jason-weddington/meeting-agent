@@ -1,0 +1,6 @@
+{
+  "_comment": "Custom pronunciation lexicon for Kokoro TTS. Copy to pronunciations.json and add your own entries. Use: meeting-agent --pronunciations pronunciations.json",
+  "_usage": "Keys = words, values = IPA phonemes for misaki G2P. Case variants (lower/capitalized) are auto-expanded. Keys starting with _ are ignored.",
+  "Ruchi": "ɹˈuːʧi",
+  "Nguyen": "wˈɪn"
+}

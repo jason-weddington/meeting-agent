@@ -23,3 +23,9 @@ htmlcov/
 .DS_Store
 
 .claude/
+
+# User-specific pronunciation lexicon (may contain real names)
+pronunciations.json
+
+# User-specific project context (may contain org-specific info)
+context/

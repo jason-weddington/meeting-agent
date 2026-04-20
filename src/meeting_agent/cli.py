@@ -182,6 +182,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "--llm-backend=bedrock (the default)."
         ),
     )
+    parser.add_argument(
+        "--pronunciations",
+        default=None,
+        dest="pronunciations",
+        metavar="PATH",
+        type=Path,
+        help="JSON file mapping words to IPA phonemes for TTS pronunciation overrides",
+    )
 
     return parser
 
@@ -244,6 +252,7 @@ def main() -> None:
         classifier_model=args.classifier_model,
         ollama_host=args.ollama_host,
         mcp_server=mcp_server,
+        pronunciation_lexicon=args.pronunciations,
     )
 
     try:

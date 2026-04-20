@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -214,3 +215,85 @@ def test_stream_synthesize_integration() -> None:
     for chunk in chunks:
         assert isinstance(chunk, np.ndarray)
         assert chunk.dtype == np.float32
+
+
+# ---------------------------------------------------------------------------
+# Pronunciation lexicon tests
+# ---------------------------------------------------------------------------
+
+
+class TestLoadLexicon:
+    """Tests for _load_lexicon helper."""
+
+    def test_load_lexicon_expands_case_variants(self, tmp_path: Path) -> None:
+        """_load_lexicon produces lowercase and capitalized variants."""
+        from meeting_agent.tts import _load_lexicon
+
+        lexicon_file = tmp_path / "lex.json"
+        lexicon_file.write_text('{"Ruchi": "ɹˈuːʧi"}')
+
+        result = _load_lexicon(lexicon_file)
+
+        assert result["Ruchi"] == "ɹˈuːʧi"
+        assert result["ruchi"] == "ɹˈuːʧi"
+
+    def test_load_lexicon_skips_underscore_keys(self, tmp_path: Path) -> None:
+        """Keys starting with _ (like _comment) are ignored."""
+        from meeting_agent.tts import _load_lexicon
+
+        lexicon_file = tmp_path / "lex.json"
+        lexicon_file.write_text('{"_comment": "ignored", "Aziz": "ɑːzˈiːz"}')
+
+        result = _load_lexicon(lexicon_file)
+
+        assert "_comment" not in result
+        assert "Aziz" in result
+
+
+@patch("meeting_agent.tts.load_model")
+def test_pronunciation_lexicon_injected(mock_load_model: MagicMock, tmp_path: Path) -> None:
+    """TTS injects lexicon entries into the G2P pipeline's golds dict."""
+    mock_model = MagicMock()
+    mock_load_model.return_value = mock_model
+    mock_model.generate.return_value = iter([_make_result(np.array([0.0], dtype=np.float32))])
+
+    # Mock the pipeline's g2p.lexicon.golds
+    mock_pipeline = MagicMock()
+    mock_pipeline.g2p.lexicon.golds = {}
+    mock_model._get_pipeline.return_value = mock_pipeline
+
+    lexicon_file = tmp_path / "pronunciations.json"
+    lexicon_file.write_text('{"Mamun": "mɑːmˈuːn"}')
+
+    tts = TTS(pronunciation_lexicon=lexicon_file)  # noqa: F841
+
+    assert mock_model._get_pipeline.called
+    assert "Mamun" in mock_pipeline.g2p.lexicon.golds
+    assert "mamun" in mock_pipeline.g2p.lexicon.golds
+    assert mock_pipeline.g2p.lexicon.golds["Mamun"] == "mɑːmˈuːn"
+
+
+@patch("meeting_agent.tts.load_model")
+def test_no_lexicon_skips_injection(mock_load_model: MagicMock) -> None:
+    """TTS without pronunciation_lexicon does not call _get_pipeline."""
+    mock_model = MagicMock()
+    mock_load_model.return_value = mock_model
+    mock_model.generate.return_value = iter([])
+
+    tts = TTS()  # noqa: F841
+
+    mock_model._get_pipeline.assert_not_called()
+
+
+@pytest.mark.integration
+def test_pronunciation_lexicon_integration(tmp_path: Path) -> None:
+    """Real end-to-end: injected lexicon entries override espeak fallback."""
+    lexicon_file = tmp_path / "pronunciations.json"
+    lexicon_file.write_text('{"Ruchi": "ɹˈuːʧi"}')
+
+    tts = TTS(pronunciation_lexicon=lexicon_file)
+
+    # Verify the entry landed in the actual G2P lexicon
+    pipeline = tts._model._get_pipeline("a")
+    assert pipeline.g2p.lexicon.golds.get("Ruchi") == "ɹˈuːʧi"
+    assert pipeline.g2p.lexicon.golds.get("ruchi") == "ɹˈuːʧi"

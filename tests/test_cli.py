@@ -400,3 +400,27 @@ def test_cli_kb_mcp_single_token():
     config = mock_cls.call_args[0][0]
 
     assert config.mcp_server == MCPServerConfig(command="/usr/local/bin/kb-srv", args=())
+
+
+# ---------------------------------------------------------------------------
+# --pronunciations
+# ---------------------------------------------------------------------------
+
+
+def test_cli_pronunciations_defaults_to_none():
+    """No --pronunciations flag → PipelineConfig.pronunciation_lexicon is None."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent"])
+    config = mock_cls.call_args[0][0]
+
+    assert config.pronunciation_lexicon is None
+
+
+def test_cli_pronunciations_forwarded(tmp_path):
+    """--pronunciations path is forwarded to PipelineConfig."""
+    lex = tmp_path / "lex.json"
+    lex.write_text('{"Ruchi": "ɹˈuːʧi"}')
+
+    mock_cls = _run_main_with_pipeline(["meeting-agent", "--pronunciations", str(lex)])
+    config = mock_cls.call_args[0][0]
+
+    assert config.pronunciation_lexicon == lex

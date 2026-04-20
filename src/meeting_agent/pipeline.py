@@ -297,6 +297,7 @@ class PipelineConfig:
     trace_verbose: bool = False
     trace_log_dir: Path | None = None
     mcp_server: MCPServerConfig | None = None  # None → no MCP KB grounding
+    pronunciation_lexicon: Path | None = None  # None → no custom pronunciations
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +371,7 @@ class Pipeline:
         # Build components — model loads happen here.
         chunks_iter = audio.record_chunks(device=config.input_device, chunk_ms=_CHUNK_MS)
         asr = StreamingASR(initial_prompt=config.asr_initial_prompt)
-        tts = TTS()
+        tts = TTS(pronunciation_lexicon=config.pronunciation_lexicon)
         llm: LLMClient = _build_llm_client(config)
         classifier: Classifier = _build_classifier(config)
 
