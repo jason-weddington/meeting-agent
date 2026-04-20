@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.11.0 (2026-04-20)
+
+### Features
+
+- Custom pronunciation lexicon for TTS
+  ([`8014058`](https://github.com/jason-weddington/meeting-agent/commit/8014058eed1c98db886285e91986755a3b01ca7c))
+
+
 ## v0.10.3 (2026-04-20)
 
 ### Bug Fixes
