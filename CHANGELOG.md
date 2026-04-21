@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.13.0 (2026-04-21)
+
+### Features
+
+- **mode**: --just-us 1:1 working-session mode (V3.1)
+  ([`5cf6631`](https://github.com/repos/meeting-agent/commit/5cf6631a2bc486136c641d6a810c20e196558ba5))
+
+
 ## v0.12.0 (2026-04-21)
 
 ### Features
