@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.12.0 (2026-04-21)
+
+### Features
+
+- Inject current timestamp into each LLM turn
+  ([`14a2bc5`](https://github.com/jason-weddington/meeting-agent/commit/14a2bc5b265f1f9d09511c23afa071f0ea6e8de7))
+
+
 ## v0.11.0 (2026-04-20)
 
 ### Features
