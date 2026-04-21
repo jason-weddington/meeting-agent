@@ -20,6 +20,14 @@ from meeting_agent.llm import (
 from meeting_agent.mcp_client import MCPClientError, ToolResult, ToolSpec
 from meeting_agent.trace import Tracer
 
+_FIXED_TIMESTAMP = "[current_time: 2026-01-15T10:00-05:00]"
+
+
+@pytest.fixture(autouse=True)
+def _stable_timestamp(monkeypatch):
+    """Pin _current_timestamp so message-shape assertions are deterministic."""
+    monkeypatch.setattr("meeting_agent.llm._current_timestamp", lambda: _FIXED_TIMESTAMP)
+
 
 def _make_stream(*text_deltas: str, extra_events=None):
     """Build a fake converse_stream response stream."""
@@ -129,7 +137,8 @@ def test_respond_stream_first_turn_messages_shape():
         list(client.respond_stream(context, conversation))
 
     messages = mock_client.converse_stream.call_args[1]["messages"]
-    assert messages == [{"role": "user", "content": [{"text": "Jason: First message"}]}]
+    expected_text = f"{_FIXED_TIMESTAMP}\nJason: First message"
+    assert messages == [{"role": "user", "content": [{"text": expected_text}]}]
 
 
 def test_respond_stream_multi_turn_messages_shape():
@@ -155,7 +164,7 @@ def test_respond_stream_multi_turn_messages_shape():
         {"role": "assistant", "content": [{"text": "a1"}]},
         {"role": "user", "content": [{"text": "Jason: q2"}]},
         {"role": "assistant", "content": [{"text": "a2"}]},
-        {"role": "user", "content": [{"text": "Jason: q3"}]},
+        {"role": "user", "content": [{"text": f"{_FIXED_TIMESTAMP}\nJason: q3"}]},
     ]
 
 
@@ -261,7 +270,7 @@ def test_consecutive_non_agent_turns_collapse_into_one_user_message():
     assert messages == [
         {"role": "user", "content": [{"text": "Jason: q1\nAziz: q2"}]},
         {"role": "assistant", "content": [{"text": "a1"}]},
-        {"role": "user", "content": [{"text": "Marcus: q3\nJason: q4"}]},
+        {"role": "user", "content": [{"text": f"Marcus: q3\n{_FIXED_TIMESTAMP}\nJason: q4"}]},
     ]
 
 
@@ -697,7 +706,7 @@ def test_ollama_llm_user_role_collapses_non_agent_speakers():
     assert non_system == [
         {"role": "user", "content": "Jason: q1\nAziz: q2"},
         {"role": "assistant", "content": "a1"},
-        {"role": "user", "content": "Marcus: q3\nJason: q4"},
+        {"role": "user", "content": f"Marcus: q3\n{_FIXED_TIMESTAMP}\nJason: q4"},
     ]
 
 
@@ -711,7 +720,7 @@ def test_ollama_llm_first_turn_messages_shape():
     messages = _build_ollama_messages(conversation, context)
 
     assert messages[0]["role"] == "system"
-    assert messages[1] == {"role": "user", "content": "Jason: First message"}
+    assert messages[1] == {"role": "user", "content": f"{_FIXED_TIMESTAMP}\nJason: First message"}
     assert len(messages) == 2
 
 
