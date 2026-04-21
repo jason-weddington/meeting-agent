@@ -40,6 +40,28 @@ produce a short substantive answer with an embedded parenthetical check
 rather than asking for clarification — "Sounds like Thursday the 23rd —
 is that what you meant?" is better than "Which date?"."""
 
+DEFAULT_DUET_SYSTEM_PROMPT: str = """You are in a 1:1 working session with a
+single collaborator. Think of this as a focused brainstorming / sharpening
+conversation — like pair-programming, but for whatever problem they bring.
+
+Default to engaging substantively. Silence is rarely the right move here —
+your collaborator is here specifically to work with you. When you do speak,
+write as you would speak: natural prose, no markdown, no bulleted or
+numbered lists, no symbols a text-to-speech engine would pronounce as words.
+Keep responses concise (under three sentences) unless asked for more detail
+or the topic genuinely warrants it.
+
+If the user asks you to repeat or rephrase ("say that again", "what did you
+just say?"), re-state or rephrase your prior turn using the conversation
+history. Do not acknowledge audio trouble; just answer.
+
+When the conversation produces something worth remembering — a decision,
+an insight, a framework, a plan — briefly offer to capture it to the
+knowledge base before moving on. Example: "want me to save that as a
+decision?" or "should I put that in the KB?" If they accept, use the
+appropriate KB tool. Don't ask every turn; only when something genuinely
+decision- or reference-worthy surfaces. Trust your judgement."""
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -190,6 +212,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="JSON file mapping words to IPA phonemes for TTS pronunciation overrides",
     )
+    parser.add_argument(
+        "--just-us",
+        action="store_true",
+        default=False,
+        dest="just_us",
+        help=(
+            "Enable 1:1 mode (sets mode=duet). Loosens silence rules and offers "
+            "to save worthwhile outputs to the KB. Default: disabled (mode=ambient)."
+        ),
+    )
 
     return parser
 
@@ -215,7 +247,9 @@ def main() -> None:
     if args.initial_prompt_file is not None:
         initial_prompt = args.initial_prompt_file.read_text()
 
-    # Resolve system prompt (one source wins; all four flags are mutually exclusive)
+    # Resolve system prompt (one source wins; all four flags are mutually exclusive).
+    # When --just-us is set and no explicit prompt source is provided, use the
+    # DUET default prompt; otherwise fall back to the ambient default.
     if args.context_dir is not None:
         system_prompt: str = load_context(args.context_dir)
     elif args.context_uri is not None:
@@ -224,6 +258,8 @@ def main() -> None:
         system_prompt = args.system_prompt
     elif args.system_prompt_file is not None:
         system_prompt = args.system_prompt_file.read_text()
+    elif args.just_us:
+        system_prompt = DEFAULT_DUET_SYSTEM_PROMPT
     else:
         system_prompt = DEFAULT_SYSTEM_PROMPT
 
@@ -253,6 +289,7 @@ def main() -> None:
         ollama_host=args.ollama_host,
         mcp_server=mcp_server,
         pronunciation_lexicon=args.pronunciations,
+        mode="duet" if args.just_us else "ambient",
     )
 
     try:

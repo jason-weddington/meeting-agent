@@ -77,6 +77,10 @@ The Ollama backends both hit the same `ollama serve` daemon. Use `--ollama-host`
 or the `OLLAMA_HOST` env var to override the default `http://localhost:11434`
 (shared by both classifier and response-LLM paths).
 
+### 1:1 mode (--just-us)
+
+Use `--just-us` to enter `duet` mode — a focused 1:1 working session where the classifier defaults to `full_answer` (no airtime cap) and the agent proactively offers to save decisions/insights to the KB. See README.md for full details and the smoke-test plan.
+
 ### KB grounding (MCP)
 
 Enable real-time KB grounding via a local stdio MCP server using `--kb-mcp`:

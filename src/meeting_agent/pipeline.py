@@ -298,6 +298,7 @@ class PipelineConfig:
     trace_log_dir: Path | None = None
     mcp_server: MCPServerConfig | None = None  # None → no MCP KB grounding
     pronunciation_lexicon: Path | None = None  # None → no custom pronunciations
+    mode: Literal["ambient", "duet"] = "ambient"  # "duet" = 1:1 mode (--just-us)
 
 
 # ---------------------------------------------------------------------------
@@ -319,9 +320,11 @@ def _build_classifier(config: PipelineConfig) -> Classifier:
         return OllamaClassifier(
             model=config.classifier_model or OllamaClassifier.DEFAULT_MODEL,
             host=config.ollama_host,
+            mode=config.mode,
         )
     return BedrockClassifier(
         model_id=config.classifier_model or BedrockClassifier.DEFAULT_MODEL_ID,
+        mode=config.mode,
     )
 
 

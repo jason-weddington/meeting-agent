@@ -109,6 +109,28 @@ First invocation cold-loads the model (20–30s for a 35B MoE). Subsequent runs 
 
 The `--kb-mcp` flag takes the full command string to launch a stdio MCP server. A wrapper script like `~/scripts/personal-kb.sh` is the ergonomic way to keep the command out of the flag. The meeting-agent spawns the server as a subprocess, speaks JSON-RPC over stdin/stdout, and terminates it on shutdown. Shell-exported environment variables (e.g. `KB_DATABASE_URL`) are inherited by the MCP subprocess.
 
+### Just-us mode (1:1 working session)
+
+The default mode (`ambient`) is designed for a multi-person meeting where the agent is a passive participant that speaks only when clearly addressed. `--just-us` switches to a focused 1:1 mode (`duet`) optimized for working directly with the agent:
+
+- **Classifier loosens silence**: every non-garbled utterance is treated as addressed to the agent — default action is `full_answer`. No airtime budget applies.
+- **Proactive KB capture**: when the conversation produces a decision, insight, or framework, the agent offers to save it to the knowledge base (`"want me to save that as a decision?"`). Writes happen only if you say yes.
+
+```bash
+# 1:1 working session with KB grounding
+uv run meeting-agent --just-us --kb-mcp ~/scripts/personal-kb.sh --trace --verbose
+
+# Fully local 1:1 session
+uv run meeting-agent \
+    --just-us \
+    --classifier-backend ollama \
+    --llm-backend ollama \
+    --kb-mcp ~/scripts/personal-kb.sh \
+    --trace --verbose
+```
+
+Use `ambient` (default) when you are in a multi-person meeting and want the agent to listen quietly and speak selectively. Use `--just-us` when you want a focused working session — like pair-programming or brainstorming — with the agent as your primary collaborator.
+
 ## Design notes and prior art
 
 Key decisions and rationale are captured in the knowledge base:

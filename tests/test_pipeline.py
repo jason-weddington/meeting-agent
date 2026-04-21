@@ -1176,6 +1176,30 @@ def test_classifier_factory_ollama_default_model():
     assert classifier.model == OllamaClassifier.DEFAULT_MODEL
 
 
+def test_classifier_factory_passes_mode_to_bedrock_classifier():
+    """PipelineConfig(mode='duet') reaches the BedrockClassifier constructor."""
+    config = PipelineConfig(mode="duet")
+    classifier = _build_classifier(config)
+    assert isinstance(classifier, BedrockClassifier)
+    assert classifier.mode == "duet"
+
+
+def test_classifier_factory_passes_mode_to_ollama_classifier():
+    """PipelineConfig(mode='duet', classifier_backend='ollama') reaches OllamaClassifier."""
+    config = PipelineConfig(classifier_backend="ollama", mode="duet")
+    classifier = _build_classifier(config)
+    assert isinstance(classifier, OllamaClassifier)
+    assert classifier.mode == "duet"
+
+
+def test_classifier_factory_defaults_mode_to_ambient():
+    """PipelineConfig() → mode='ambient' reaches the BedrockClassifier."""
+    config = PipelineConfig()
+    classifier = _build_classifier(config)
+    assert isinstance(classifier, BedrockClassifier)
+    assert classifier.mode == "ambient"
+
+
 def test_pipeline_warms_up_ollama_classifier_on_run():
     """Pipeline.run() calls warm_up() on an OllamaClassifier backend before the first utterance."""
     # A real OllamaClassifier instance so isinstance(classifier, OllamaClassifier) passes;

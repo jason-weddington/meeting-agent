@@ -15,6 +15,7 @@ from meeting_agent.classifier import (
     Decision,
     OllamaClassifier,
     SessionState,
+    _build_system_prompt,
 )
 from meeting_agent.llm import ProjectContext, Turn
 
@@ -625,3 +626,79 @@ def test_ollama_warm_up_returns_false_on_failure(caplog):
 def test_ollama_default_timeout_accommodates_cold_load():
     """DEFAULT_TIMEOUT_S is at least 30s so large-model cold-load doesn't abort."""
     assert OllamaClassifier.DEFAULT_TIMEOUT_S >= 30.0
+
+
+# ---------------------------------------------------------------------------
+# Mode-specific system prompt tests
+# ---------------------------------------------------------------------------
+
+
+def test_build_system_prompt_ambient_mode_rule_1():
+    """AMBIENT prompt contains 'Silence is a first-class output' sentinel."""
+    context = _make_context()
+    prompt = _build_system_prompt(context, mode="ambient")
+    assert "Silence is a first-class output" in prompt
+
+
+def test_build_system_prompt_duet_mode_rule_1():
+    """DUET prompt contains '1:1 working session' and 'Default to \"full_answer\"' sentinels."""
+    context = _make_context()
+    prompt = _build_system_prompt(context, mode="duet")
+    assert "1:1 working session" in prompt
+    assert 'Default to "full_answer"' in prompt
+
+
+def test_build_system_prompt_duet_mode_has_no_airtime_cap():
+    """DUET prompt does NOT contain the 'Airtime budget' phrase from the AMBIENT rule."""
+    context = _make_context()
+    prompt = _build_system_prompt(context, mode="duet")
+    assert "Airtime budget" not in prompt
+
+
+def test_build_system_prompt_shared_rules_identical_across_modes():
+    """Rules #2, #3, #5 substrings are verbatim-identical in both modes."""
+    context = _make_context()
+    ambient = _build_system_prompt(context, mode="ambient")
+    duet = _build_system_prompt(context, mode="duet")
+
+    # Rule #2 sentinel
+    rule2_sentinel = 'Never choose "silent" + attempt to indicate'
+    assert rule2_sentinel in ambient
+    assert rule2_sentinel in duet
+
+    # Rule #3 sentinel
+    rule3_sentinel = "Human is asking the agent to repeat"
+    assert rule3_sentinel in ambient
+    assert rule3_sentinel in duet
+
+    # Rule #5 sentinel
+    rule5_sentinel = "Speaker attribution: per-person speech patterns"
+    assert rule5_sentinel in ambient
+    assert rule5_sentinel in duet
+
+
+def test_bedrock_classifier_honors_mode_param():
+    """BedrockClassifier(mode='duet') sends the DUET system prompt to Bedrock."""
+    mock_client = MagicMock()
+    mock_client.converse.return_value = _make_classify_response("Alice", "full_answer", 0.9)
+    with patch("boto3.client", return_value=mock_client):
+        classifier = BedrockClassifier(mode="duet")
+        classifier.classify(_make_utterance(), _make_confidence(), _make_context(), _make_session())
+
+    system_text = mock_client.converse.call_args[1]["system"][0]["text"]
+    assert "1:1 working session" in system_text
+    assert "Airtime budget" not in system_text
+
+
+def test_ollama_classifier_honors_mode_param():
+    """OllamaClassifier(mode='duet') sends the DUET system prompt to Ollama."""
+    mock_client = MagicMock()
+    mock_client.chat.return_value = _make_ollama_response("Alice", "full_answer", 0.9)
+    with patch("meeting_agent.classifier.ollama.Client", return_value=mock_client):
+        classifier = OllamaClassifier(mode="duet")
+        classifier.classify(_make_utterance(), _make_confidence(), _make_context(), _make_session())
+
+    messages = mock_client.chat.call_args[1]["messages"]
+    system_msg = next(m for m in messages if m["role"] == "system")
+    assert "1:1 working session" in system_msg["content"]
+    assert "Airtime budget" not in system_msg["content"]

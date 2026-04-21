@@ -424,3 +424,45 @@ def test_cli_pronunciations_forwarded(tmp_path):
     config = mock_cls.call_args[0][0]
 
     assert config.pronunciation_lexicon == lex
+
+
+# ---------------------------------------------------------------------------
+# --just-us flag
+# ---------------------------------------------------------------------------
+
+
+def test_cli_just_us_flag_sets_duet_mode():
+    """--just-us sets config.mode to 'duet'."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent", "--just-us"])
+    config = mock_cls.call_args[0][0]
+    assert config.mode == "duet"
+
+
+def test_cli_no_just_us_flag_defaults_to_ambient():
+    """No --just-us flag → config.mode defaults to 'ambient'."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent"])
+    config = mock_cls.call_args[0][0]
+    assert config.mode == "ambient"
+
+
+def test_cli_just_us_selects_duet_default_prompt():
+    """--just-us with no explicit prompt → system_prompt contains the DUET sentinel."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent", "--just-us"])
+    config = mock_cls.call_args[0][0]
+    assert "1:1 working session" in config.context.system_prompt
+
+
+def test_cli_ambient_selects_ambient_default_prompt():
+    """No --just-us → system_prompt contains the ambient sentinel."""
+    mock_cls = _run_main_with_pipeline(["meeting-agent"])
+    config = mock_cls.call_args[0][0]
+    assert "real-time participant in a meeting" in config.context.system_prompt
+
+
+def test_cli_just_us_respects_explicit_system_prompt():
+    """--just-us --system-prompt 'custom' → explicit prompt wins over DUET default."""
+    mock_cls = _run_main_with_pipeline(
+        ["meeting-agent", "--just-us", "--system-prompt", "custom prompt here"]
+    )
+    config = mock_cls.call_args[0][0]
+    assert config.context.system_prompt == "custom prompt here"

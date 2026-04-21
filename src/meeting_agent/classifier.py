@@ -165,40 +165,9 @@ class Classifier(Protocol):
 # Shared prompt builders (used by both backends unchanged)
 # ---------------------------------------------------------------------------
 
+# Mode-specific rule blocks — rule #1 and rule #4 vary; #2, #3, #5 are identical.
 
-def _build_system_prompt(context: ProjectContext) -> str:
-    """Build the classifier system prompt, embedding the project context verbatim."""
-    return f"""\
-You are the gatekeeper for a real-time AI meeting participant. For each utterance
-in the meeting, decide two things: (1) who said it, (2) what the agent should do.
-
-# Project context
-
-{context.system_prompt}
-
-# Your output
-
-Return a JSON object with three fields:
-
-- speaker: The attributed speaker's name from the known roster above, or the
-  string "unknown" if you cannot confidently attribute. Use the speech-pattern
-  signatures + project context as your primary signal; each person's cluster of
-  tics + role + topic ownership is near-unique even when individual phrases
-  overlap.
-
-- action: One of:
-  - "silent"        — the default. Choose this when the agent is not being
-                      addressed, when the transcript is garbled or unclear,
-                      when the agent has spoken recently and another
-                      contribution would be noisy, or when there is any doubt.
-  - "hedged_answer" — the agent was addressed but the content is ambiguous.
-                      The response LLM will produce a short substantive reply
-                      with an embedded parenthetical check.
-  - "full_answer"   — the agent was clearly addressed and the question is
-                      unambiguous; the response LLM will produce a direct reply.
-
-- confidence: Your own 0.0–1.0 confidence in the decision.
-
+_AMBIENT_RULES: str = """\
 # Decision rules — follow strictly
 
 1. Silence is a first-class output, not an error. Prefer it. The agent is an
@@ -233,6 +202,89 @@ Return a JSON object with three fields:
    whole cluster, not any single phrase. If the cluster doesn't match any
    known speaker with reasonable confidence, return "unknown".\
 """
+
+_DUET_RULES: str = """\
+# Decision rules — follow strictly
+
+1. This is a 1:1 working session. Every non-garbled utterance from the user is
+   addressed to you. Default to "full_answer". Return "silent" only when the
+   utterance looks like ASR hallucination (covered by rule #3) or is an echo
+   of the agent's own prior turn (covered by rule #5 via speaker=agent attribution).
+
+2. Never choose "silent" + attempt to indicate the agent should ask for
+   clarification. Clarifying questions are the response LLM's job, not yours.
+   Your choice is only: respond at all (hedged/full) or don't (silent).
+
+3. Audio-failure repair is about direction. The agent must not ask humans to
+   repeat themselves, and must not respond to its own ASR hallucinations.
+   But humans asking the agent to repeat or clarify is a legitimate meeting
+   contribution and should be handled like any other addressed question.
+
+   - Transcript looks garbled OR ASR confidence is poor (avg_logprob below
+     about -1.0, no_speech_prob above 0.6, or compression_ratio above 2.4):
+     return "silent". The agent should never react to noise.
+   - Agent is asking the human to repeat ("sorry, can you repeat?",
+     "I didn't catch that"): the response LLM is never supposed to produce
+     this, so it should not appear; if it somehow does, return "silent".
+   - Human is asking the agent to repeat or rephrase ("can you say that
+     again?", "what did you just say?", "I didn't hear you"): return
+     "full_answer". The response LLM will re-state or rephrase its prior
+     turn using the rolling transcript.
+
+4. No airtime cap in 1:1 mode. Responding every turn is expected. The user is
+   here specifically to work with you.
+
+5. Speaker attribution: per-person speech patterns + role + topic ownership
+   form a near-unique cluster even when individual tics are shared. Use the
+   whole cluster, not any single phrase. If the cluster doesn't match any
+   known speaker with reasonable confidence, return "unknown".\
+"""
+
+
+def _build_system_prompt(
+    context: ProjectContext,
+    mode: Literal["ambient", "duet"] = "ambient",
+) -> str:
+    """Build the classifier system prompt, embedding the project context verbatim.
+
+    Args:
+        context: Stable per-meeting project context (speaker roster, etc.).
+        mode: ``"ambient"`` (default multi-person behavior) or ``"duet"``
+            (1:1 working session — loosened silence rules, no airtime cap).
+    """
+    rules = _DUET_RULES if mode == "duet" else _AMBIENT_RULES
+    return f"""\
+You are the gatekeeper for a real-time AI meeting participant. For each utterance
+in the meeting, decide two things: (1) who said it, (2) what the agent should do.
+
+# Project context
+
+{context.system_prompt}
+
+# Your output
+
+Return a JSON object with three fields:
+
+- speaker: The attributed speaker's name from the known roster above, or the
+  string "unknown" if you cannot confidently attribute. Use the speech-pattern
+  signatures + project context as your primary signal; each person's cluster of
+  tics + role + topic ownership is near-unique even when individual phrases
+  overlap.
+
+- action: One of:
+  - "silent"        — the default. Choose this when the agent is not being
+                      addressed, when the transcript is garbled or unclear,
+                      when the agent has spoken recently and another
+                      contribution would be noisy, or when there is any doubt.
+  - "hedged_answer" — the agent was addressed but the content is ambiguous.
+                      The response LLM will produce a short substantive reply
+                      with an embedded parenthetical check.
+  - "full_answer"   — the agent was clearly addressed and the question is
+                      unambiguous; the response LLM will produce a direct reply.
+
+- confidence: Your own 0.0–1.0 confidence in the decision.
+
+{rules}"""
 
 
 def _build_user_prompt(
@@ -287,11 +339,13 @@ class BedrockClassifier:
         model_id: str = DEFAULT_MODEL_ID,
         region: str = DEFAULT_REGION,
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        mode: Literal["ambient", "duet"] = "ambient",
     ) -> None:
         """Store config; the boto3 client is lazy-created on first classify call."""
         self.model_id = model_id
         self.region = region
         self.timeout_s = timeout_s
+        self.mode = mode
         self._client: BedrockRuntimeClient | None = None
 
     def _get_client(self) -> BedrockRuntimeClient:
@@ -331,7 +385,7 @@ class BedrockClassifier:
         try:
             client = self._get_client()
             system: list[dict[str, Any]] = [
-                {"text": _build_system_prompt(context)},
+                {"text": _build_system_prompt(context, mode=self.mode)},
                 {"cachePoint": {"type": "default", "ttl": "1h"}},
             ]
             messages: list[dict[str, Any]] = [
@@ -406,6 +460,7 @@ class OllamaClassifier:
         model: str = DEFAULT_MODEL,
         host: str | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        mode: Literal["ambient", "duet"] = "ambient",
     ) -> None:
         """Store config; the Ollama client is lazy-created on first classify call.
 
@@ -414,10 +469,12 @@ class OllamaClassifier:
             host: Ollama daemon URL.  Falls back to the ``OLLAMA_HOST`` environment
                 variable, then ``http://localhost:11434``.
             timeout_s: HTTP timeout in seconds for each classify call.
+            mode: ``"ambient"`` (default) or ``"duet"`` (1:1 working session).
         """
         self.model = model
         self.host = host or os.environ.get("OLLAMA_HOST") or self.DEFAULT_HOST
         self.timeout_s = timeout_s
+        self.mode = mode
         self._client: ollama.Client | None = None
 
     def _get_client(self) -> ollama.Client:
@@ -475,7 +532,7 @@ class OllamaClassifier:
             on any error.
         """
         try:
-            system = _build_system_prompt(context)
+            system = _build_system_prompt(context, mode=self.mode)
             user = _build_user_prompt(utterance, confidence, session)
 
             response = self._get_client().chat(

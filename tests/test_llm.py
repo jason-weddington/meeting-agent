@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import meeting_agent.llm as _llm_module
 from meeting_agent.llm import (
     BedrockClient,
     Conversation,
@@ -19,6 +20,9 @@ from meeting_agent.llm import (
 )
 from meeting_agent.mcp_client import MCPClientError, ToolResult, ToolSpec
 from meeting_agent.trace import Tracer
+
+# Capture the real function before the autouse fixture patches it.
+_REAL_CURRENT_TIMESTAMP = _llm_module._current_timestamp
 
 _FIXED_TIMESTAMP = "[current_time: 2026-01-15T10:00-05:00]"
 
@@ -1955,3 +1959,17 @@ def test_ollama_respond_stream_no_narration_guardrail_in_fast_path():
     messages = mock_client.chat.call_args[1]["messages"]
     system_msg = next(m for m in messages if m["role"] == "system")
     assert "narrate briefly" not in system_msg["content"]
+
+
+# ---------------------------------------------------------------------------
+# _current_timestamp utility
+# ---------------------------------------------------------------------------
+
+
+def test_current_timestamp_returns_bracketed_iso_string():
+    """_current_timestamp() returns a bracketed current_time tag with ISO format."""
+    # Use the real function captured at module import time, before the autouse
+    # fixture patches meeting_agent.llm._current_timestamp.
+    result = _REAL_CURRENT_TIMESTAMP()
+    assert result.startswith("[current_time: ")
+    assert result.endswith("]")
